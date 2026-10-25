@@ -4,13 +4,14 @@ use std::{
     io::{self, Read, Write},
     os::fd::{AsRawFd, RawFd},
     sync::atomic::{AtomicI32, Ordering},
+    time::{Duration, Instant},
 };
 
 use crate::{Route, RouteAction, RouteChange, macos::rtmsg::m_rtmsg};
 use libc::{
-    AF_INET, AF_INET6, AF_ROUTE, AF_UNSPEC, RTA_DST, RTA_GATEWAY, RTA_IFP, RTA_NETMASK, RTAX_MAX,
-    RTF_GATEWAY, RTF_HOST, RTF_STATIC, RTF_UP, RTM_ADD, RTM_CHANGE, RTM_DELETE, RTM_GET,
-    RTM_VERSION, SO_USELOOPBACK, SOCK_RAW, SOL_SOCKET, rt_msghdr,
+    AF_INET, AF_INET6, AF_ROUTE, AF_UNSPEC, F_SETFD, FD_CLOEXEC, RTA_DST, RTA_GATEWAY, RTA_IFP,
+    RTA_NETMASK, RTAX_MAX, RTF_GATEWAY, RTF_HOST, RTF_STATIC, RTF_UP, RTM_ADD, RTM_CHANGE,
+    RTM_DELETE, RTM_GET, RTM_VERSION, SO_USELOOPBACK, SOCK_RAW, SOL_SOCKET, rt_msghdr,
 };
 
 /// `RTF_IFSCOPE` is the XNU flag that ties a route to a specific interface
@@ -19,6 +20,13 @@ use libc::{
 const RTF_IFSCOPE: i32 = 0x1000000;
 static ROUTE_SEQUENCE: AtomicI32 = AtomicI32::new(0);
 
+/// XNU drops a routing message, the reply to a request included, for a
+/// socket whose receive buffer is full, so a request waits for its reply only
+/// this long.
+const REPLY_TIMEOUT: Duration = Duration::from_secs(1);
+
+/// A routing socket. `add`, `delete` and `monitor` use it, so options set
+/// through [`AsRawFd`] apply to them; every `get` opens a socket of its own.
 pub struct RouteSock {
     fd: RawFd,
 }
@@ -98,16 +106,19 @@ impl RouteAction for RouteSock {
         rtmsg.hdr.rtm_pid = unsafe { libc::getpid() };
         rtmsg.hdr.rtm_msglen = rtmsg.len() as u16;
 
-        self.with_request_loopback(|socket| {
-            socket.write_all(route_msg_bytes(&rtmsg))?;
+        // Every routing socket receives every routing message on the host, so
+        // a long-lived one fills up between two requests and the kernel drops
+        // the reply. A fresh socket is empty, and loopback, on by default,
+        // delivers the reply to it.
+        let mut socket = Self::open()?;
+        socket.write_all(route_msg_bytes(&rtmsg))?;
 
-            let mut response = socket.read_request_response(seq, RTM_GET as u8)?;
-            if response.hdr.rtm_errno != 0 {
-                return Err(code2error(response.hdr.rtm_errno));
-            }
+        let mut response = socket.read_request_response(seq, RTM_GET as u8)?;
+        if response.hdr.rtm_errno != 0 {
+            return Err(code2error(response.hdr.rtm_errno));
+        }
 
-            read_route(&mut response)
-        })
+        read_route(&mut response)
     }
 
     fn monitor(&mut self, buf: &mut [u8]) -> io::Result<(crate::RouteChange, Route)> {
@@ -137,9 +148,8 @@ impl RouteAction for RouteSock {
 
 impl RouteSock {
     pub fn new() -> io::Result<Self> {
-        let fd = syscall!(socket(AF_ROUTE, SOCK_RAW, AF_UNSPEC))?;
-        let socket = Self { fd };
-        set_route_loopback(fd, false)?;
+        let socket = Self::open()?;
+        set_route_loopback(socket.fd, false)?;
 
         Ok(socket)
     }
@@ -148,11 +158,24 @@ impl RouteSock {
         m_rtmsg::new_buf()
     }
 
+    fn open() -> io::Result<Self> {
+        let fd = syscall!(socket(AF_ROUTE, SOCK_RAW, AF_UNSPEC))?;
+        let socket = Self { fd };
+        // macOS has no SOCK_CLOEXEC.
+        syscall!(fcntl(fd, F_SETFD, FD_CLOEXEC))?;
+
+        Ok(socket)
+    }
+
     fn read_request_response(&mut self, seq: i32, expected_type: u8) -> io::Result<m_rtmsg> {
         let pid = unsafe { libc::getpid() };
+        let deadline = Instant::now() + REPLY_TIMEOUT;
         let mut buf = m_rtmsg::new_buf();
         loop {
+            self.wait_readable(deadline)?;
             let n = self.read(&mut buf)?;
+            // TODO: a foreign message that fails `message_prefix` or `parse`
+            // fails this request; only the reply needs strict parsing.
             let prefix = message_prefix(&buf[..n])?;
             if !matches!(
                 prefix.message_type,
@@ -173,26 +196,36 @@ impl RouteSock {
         }
     }
 
-    fn with_request_loopback<T>(
-        &mut self,
-        request: impl FnOnce(&mut Self) -> io::Result<T>,
-    ) -> io::Result<T> {
-        set_route_loopback(self.as_raw_fd(), true)?;
-        let result = request(self);
-        let restore = set_route_loopback(self.as_raw_fd(), false);
+    fn wait_readable(&self, deadline: Instant) -> io::Result<()> {
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "no reply on the routing socket",
+                ));
+            }
 
-        match (result, restore) {
-            (Ok(value), Ok(())) => Ok(value),
-            (Err(request_error), Ok(())) => Err(request_error),
-            (Ok(_), Err(restore_error)) => Err(restore_error),
-            (Err(request_error), Err(restore_error)) => Err(io::Error::other(format!(
-                "route request failed: {request_error}; restoring SO_USELOOPBACK also failed: {restore_error}"
-            ))),
+            let mut poll_fd = libc::pollfd {
+                fd: self.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            // Rounded up, so a sub-millisecond remainder still waits.
+            let timeout_ms = remaining.as_micros().div_ceil(1000).min(i32::MAX as u128) as i32;
+            match syscall!(poll(&mut poll_fd, 1, timeout_ms)) {
+                Ok(0) => {}
+                Ok(_) => return Ok(()),
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+                Err(error) => return Err(error),
+            }
         }
     }
 }
 
 fn next_route_sequence() -> i32 {
+    // TODO: `fetch_update` is deprecated in favor of `try_update` on current
+    // toolchains (also used in `linux/mod.rs`).
     let previous = ROUTE_SEQUENCE
         .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |sequence| {
             Some(if sequence == i32::MAX {
@@ -422,7 +455,6 @@ mod tests {
     use std::{
         collections::HashSet,
         net::{IpAddr, Ipv4Addr},
-        time::{Duration, Instant},
     };
 
     use super::*;
@@ -586,50 +618,41 @@ mod tests {
         assert!(sequences.iter().all(|sequence| *sequence > 0));
     }
 
+    fn queued_bytes(socket: &RouteSock) -> i32 {
+        let mut queued = 0;
+        syscall!(ioctl(socket.as_raw_fd(), libc::FIONREAD, &mut queued)).unwrap();
+        queued
+    }
+
     #[test]
     #[ignore = "black-box check against the live macOS routing socket"]
-    fn get_restores_loopback_and_route_messages_are_process_wide() {
-        let mut observer = RouteSock::new().unwrap();
-        let mut socket = RouteSock::new().unwrap();
-
-        socket.get(&Route::default()).unwrap();
-
-        let mut enabled = -1;
-        let mut value_len = std::mem::size_of_val(&enabled) as libc::socklen_t;
+    fn get_answers_on_a_full_socket() {
+        let route = Route::default();
+        let mut full = RouteSock::new().unwrap();
+        let mut flooder = RouteSock::new().unwrap();
+        let mut capacity = 0;
+        let mut capacity_len = std::mem::size_of_val(&capacity) as libc::socklen_t;
         syscall!(getsockopt(
-            socket.as_raw_fd(),
+            full.as_raw_fd(),
             SOL_SOCKET,
-            SO_USELOOPBACK,
-            (&mut enabled as *mut i32).cast(),
-            &mut value_len
+            libc::SO_RCVBUF,
+            (&mut capacity as *mut i32).cast(),
+            &mut capacity_len
         ))
         .unwrap();
-        assert_eq!(enabled, 0);
 
-        let deadline = Instant::now() + Duration::from_secs(1);
-        loop {
-            let remaining = deadline.saturating_duration_since(Instant::now());
-            assert!(!remaining.is_zero(), "observer did not receive the RTM_GET");
-            let mut poll_fd = libc::pollfd {
-                fd: observer.as_raw_fd(),
-                events: libc::POLLIN,
-                revents: 0,
-            };
-            let timeout_ms = remaining.as_millis().min(i32::MAX as u128) as i32;
-            let ready = syscall!(poll(&mut poll_fd, 1, timeout_ms)).unwrap();
-            assert_ne!(ready, 0, "observer did not receive the RTM_GET");
+        // Every reply reaches every routing socket, until one no longer fits.
+        let dropped = (0..10_000).any(|_| {
+            let queued = queued_bytes(&full);
+            flooder.get(&route).unwrap();
+            queued_bytes(&full) == queued
+        });
+        assert!(
+            dropped && queued_bytes(&full) > capacity / 2,
+            "the replies never filled the receive buffer"
+        );
 
-            let mut buf = RouteSock::new_buf();
-            let n = observer.read(&mut buf).unwrap();
-            let prefix = message_prefix(&buf[..n]).unwrap();
-            if prefix.message_type != RTM_GET as u8 {
-                continue;
-            }
-            let message = m_rtmsg::parse(&buf[..n]).unwrap();
-            if message.hdr.rtm_pid == unsafe { libc::getpid() } {
-                break;
-            }
-        }
+        full.get(&route).unwrap();
     }
 
     #[test]
