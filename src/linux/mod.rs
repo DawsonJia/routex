@@ -12,14 +12,14 @@ use libc::{
     sockaddr_nl,
 };
 use netlink_packet_core::{
-    NLM_F_ACK, NLM_F_CREATE, NLM_F_EXCL, NLM_F_REQUEST, NetlinkHeader, NetlinkMessage,
+    NLM_F_ACK, NLM_F_CREATE, NLM_F_DUMP, NLM_F_EXCL, NLM_F_REQUEST, NetlinkHeader, NetlinkMessage,
     NetlinkPayload,
 };
 use netlink_packet_route::{
     AddressFamily, RouteNetlinkMessage,
     route::{
-        RouteAddress, RouteAttribute, RouteHeader, RouteMessage, RouteProtocol, RouteScope,
-        RouteType,
+        RouteAddress, RouteAttribute, RouteFlags, RouteHeader, RouteMessage, RouteProtocol,
+        RouteScope, RouteType,
     },
 };
 
@@ -131,13 +131,16 @@ impl Write for RouteSock {
 
 impl Read for RouteSock {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        let n = syscall!(read(
-            self.as_raw_fd(),
-            buf.as_mut_ptr() as *mut _,
-            buf.len()
-        ))?;
-
-        Ok(n as usize)
+        loop {
+            match syscall!(read(
+                self.as_raw_fd(),
+                buf.as_mut_ptr() as *mut _,
+                buf.len()
+            )) {
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+                result => return result.map(|n| n as usize),
+            }
+        }
     }
 }
 
@@ -208,6 +211,12 @@ impl RouteAction for RouteSock {
 
     fn get(&mut self, route: &Route) -> io::Result<Route> {
         route.validate()?;
+
+        // The kernel answers a lookup of the unspecified address with the
+        // loopback route, so the default route comes from a table dump.
+        if route.destination.is_unspecified() && route.prefix == 0 {
+            return self.default_route(route);
+        }
 
         let (sequence, port_id) = self.next_command_sequence()?;
         let mut nl_hdr = NetlinkHeader::default();
@@ -294,13 +303,72 @@ impl RouteSock {
                         return Err(io::Error::other("received an ACK without a route response"));
                     }
                     NetlinkPayload::InnerMessage(RouteNetlinkMessage::NewRoute(rt_msg)) => {
-                        if let Some(candidate) = route_from_message(&rt_msg)? {
-                            return Ok(candidate);
-                        }
+                        return route_from_message(&rt_msg).ok_or_else(|| {
+                            io::Error::new(io::ErrorKind::InvalidData, "non-IP route response")
+                        });
                     }
                     payload => {
                         return Err(io::Error::other(format!(
                             "unexpected netlink route response: {payload:?}"
+                        )));
+                    }
+                }
+            }
+        }
+    }
+
+    fn default_route(&mut self, route: &Route) -> io::Result<Route> {
+        let (sequence, port_id) = self.next_command_sequence()?;
+        let mut nl_hdr = NetlinkHeader::default();
+        nl_hdr.flags = NLM_F_REQUEST | NLM_F_DUMP;
+        nl_hdr.sequence_number = sequence;
+        nl_hdr.port_number = port_id;
+
+        let mut rt_msg = RouteMessage::default();
+        rt_msg.header.address_family = address_family(route.destination);
+
+        let mut req = NetlinkMessage::new(
+            nl_hdr,
+            NetlinkPayload::from(RouteNetlinkMessage::GetRoute(rt_msg)),
+        );
+        req.finalize();
+        let mut buf = [0u8; 4096];
+        req.serialize(&mut buf[..req.buffer_len()]);
+        self.write_all(&buf[..req.buffer_len()])?;
+
+        let mut best: Option<(u32, Route)> = None;
+        loop {
+            let mut rbuf = [0u8; 16384];
+            let n = self.read(&mut rbuf)?;
+            for nlmsg in parse_nlmsgs(&rbuf[..n])? {
+                if !response_matches(&nlmsg.header, sequence, port_id) {
+                    continue;
+                }
+
+                match nlmsg.payload {
+                    NetlinkPayload::Done(_) => {
+                        return best.map(|(_, route)| route).ok_or_else(|| {
+                            io::Error::new(io::ErrorKind::NotFound, "no default route")
+                        });
+                    }
+                    NetlinkPayload::Error(e) => {
+                        return Err(e.code.map_or_else(
+                            || io::Error::other("received an ACK instead of a route dump"),
+                            netlink_error,
+                        ));
+                    }
+                    NetlinkPayload::InnerMessage(RouteNetlinkMessage::NewRoute(rt_msg)) => {
+                        if let Some((metric, candidate)) = default_route_candidate(&rt_msg, route)
+                            && best
+                                .as_ref()
+                                .is_none_or(|(best_metric, _)| metric < *best_metric)
+                        {
+                            best = Some((metric, candidate));
+                        }
+                    }
+                    payload => {
+                        return Err(io::Error::other(format!(
+                            "unexpected netlink route dump: {payload:?}"
                         )));
                     }
                 }
@@ -361,11 +429,14 @@ fn route_lookup_message(route: &Route) -> RouteMessage {
     if let Some(index) = route.ifindex {
         rt_msg.attributes.push(RouteAttribute::Oif(index));
     }
+    // Answer with the matching table entry, as macOS and Windows do, rather
+    // than with the destination as a /32 host route.
+    rt_msg.header.flags = RouteFlags::FibMatch;
 
     rt_msg
 }
 
-fn route_from_message(rt_msg: &RouteMessage) -> io::Result<Option<Route>> {
+fn route_from_message(rt_msg: &RouteMessage) -> Option<Route> {
     let mut route = Route::new(
         unspecified(rt_msg.header.address_family),
         rt_msg.header.destination_prefix_length,
@@ -373,24 +444,59 @@ fn route_from_message(rt_msg: &RouteMessage) -> io::Result<Option<Route>> {
 
     for attr in &rt_msg.attributes {
         match attr {
-            RouteAttribute::Destination(addr) => {
-                let Some(destination) = ip_addr(addr) else {
-                    return Ok(None);
-                };
-                route.destination = destination;
-            }
-            RouteAttribute::Gateway(addr) => {
-                let Some(gateway) = ip_addr(addr) else {
-                    return Ok(None);
-                };
-                route.gateway = Some(gateway);
-            }
+            RouteAttribute::Destination(addr) => route.destination = ip_addr(addr)?,
+            RouteAttribute::Gateway(addr) => route.gateway = Some(ip_addr(addr)?),
             RouteAttribute::Oif(index) => route.ifindex = Some(*index),
             _ => {}
         }
     }
 
-    Ok(Some(route))
+    Some(route)
+}
+
+/// Whether `rt_msg` is a unicast route of the main table, the only table
+/// this crate adds to and deletes from.
+fn in_main_table(rt_msg: &RouteMessage) -> bool {
+    // Tables above 255 only fit in the attribute.
+    let table = rt_msg
+        .attributes
+        .iter()
+        .find_map(|attr| match attr {
+            RouteAttribute::Table(table) => Some(*table),
+            _ => None,
+        })
+        .unwrap_or(rt_msg.header.table.into());
+
+    rt_msg.header.kind == RouteType::Unicast && table == u32::from(RouteHeader::RT_TABLE_MAIN)
+}
+
+/// A live main-table default route matching the selectors of `route`, with
+/// the metric the kernel ranks it by.
+fn default_route_candidate(rt_msg: &RouteMessage, route: &Route) -> Option<(u32, Route)> {
+    if rt_msg.header.destination_prefix_length != 0
+        || rt_msg.header.flags.contains(RouteFlags::Dead)
+        || !in_main_table(rt_msg)
+    {
+        return None;
+    }
+
+    let candidate = route_from_message(rt_msg)?;
+    let selected = route
+        .gateway
+        .is_none_or(|gateway| candidate.gateway == Some(gateway))
+        && route
+            .ifindex
+            .is_none_or(|ifindex| candidate.ifindex == Some(ifindex));
+    let metric = rt_msg
+        .attributes
+        .iter()
+        .find_map(|attr| match attr {
+            RouteAttribute::Priority(metric) => Some(*metric),
+            _ => None,
+        })
+        .unwrap_or(0);
+
+    selected.then_some((metric, candidate))
 }
 
 fn parse_nlmsgs(bytes: &[u8]) -> io::Result<Vec<NetlinkMessage<RouteNetlinkMessage>>> {
@@ -460,26 +566,29 @@ fn enqueue_route_changes(
     pending: &mut VecDeque<(RouteChange, Route)>,
 ) -> io::Result<()> {
     for message in messages {
-        match message.payload {
-            NetlinkPayload::InnerMessage(RouteNetlinkMessage::NewRoute(route)) => {
-                if let Some(route) = route_from_message(&route)? {
-                    pending.push_back((RouteChange::ADD, route));
-                }
+        let (change, rt_msg) = match message.payload {
+            NetlinkPayload::InnerMessage(RouteNetlinkMessage::NewRoute(rt_msg)) => {
+                (RouteChange::ADD, rt_msg)
             }
-            NetlinkPayload::InnerMessage(RouteNetlinkMessage::DelRoute(route)) => {
-                if let Some(route) = route_from_message(&route)? {
-                    pending.push_back((RouteChange::DELETE, route));
-                }
+            NetlinkPayload::InnerMessage(RouteNetlinkMessage::DelRoute(rt_msg)) => {
+                (RouteChange::DELETE, rt_msg)
             }
             NetlinkPayload::Error(error) => {
                 if let Some(code) = error.code {
                     return Err(netlink_error(code));
                 }
+                continue;
             }
             NetlinkPayload::Overrun(_) => {
                 return Err(io::Error::other("netlink route monitor overrun"));
             }
-            _ => {}
+            _ => continue,
+        };
+
+        if in_main_table(&rt_msg)
+            && let Some(route) = route_from_message(&rt_msg)
+        {
+            pending.push_back((change, route));
         }
     }
 
@@ -558,14 +667,37 @@ mod tests {
         message(sequence, port_number, NetlinkPayload::Error(ack))
     }
 
+    fn main_table_message(route: &Route) -> RouteMessage {
+        let mut rt_msg = route_change_message(route);
+        add_route_selectors(&mut rt_msg, route);
+        rt_msg.header.table = RouteHeader::RT_TABLE_MAIN;
+        rt_msg.header.kind = RouteType::Unicast;
+        rt_msg
+    }
+
     fn route_message(destination: Ipv4Addr, deleted: bool) -> NetlinkMessage<RouteNetlinkMessage> {
-        let route = Route::new(IpAddr::V4(destination), 32);
+        let rt_msg = main_table_message(&Route::new(IpAddr::V4(destination), 32));
         let payload = if deleted {
-            RouteNetlinkMessage::DelRoute(route_change_message(&route))
+            RouteNetlinkMessage::DelRoute(rt_msg)
         } else {
-            RouteNetlinkMessage::NewRoute(route_change_message(&route))
+            RouteNetlinkMessage::NewRoute(rt_msg)
         };
         message(0, 0, NetlinkPayload::InnerMessage(payload))
+    }
+
+    fn default_route(gateway: Ipv4Addr, ifindex: u32, metric: Option<u32>) -> RouteMessage {
+        let route = Route::default()
+            .gateway(IpAddr::V4(gateway))
+            .ifindex(ifindex);
+        let mut rt_msg = main_table_message(&route);
+        // The kernel leaves out the destination of a /0 route.
+        rt_msg
+            .attributes
+            .retain(|attr| !matches!(attr, RouteAttribute::Destination(_)));
+        if let Some(metric) = metric {
+            rt_msg.attributes.push(RouteAttribute::Priority(metric));
+        }
+        rt_msg
     }
 
     fn serialize(messages: &[NetlinkMessage<RouteNetlinkMessage>]) -> Vec<u8> {
@@ -623,6 +755,69 @@ mod tests {
     }
 
     #[test]
+    fn route_changes_outside_the_main_table_are_skipped() {
+        let mut local = main_table_message(&Route::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 32));
+        local.header.table = 255;
+        local.header.kind = RouteType::Local;
+        let mut policy = main_table_message(&Route::default());
+        // RT_TABLE_COMPAT: the real table only fits in the attribute.
+        policy.header.table = 252;
+        policy.attributes.push(RouteAttribute::Table(51820));
+        let main = route_message(Ipv4Addr::new(10, 0, 0, 1), false);
+        let messages = [local, policy]
+            .into_iter()
+            .map(|rt_msg| {
+                message(
+                    0,
+                    0,
+                    NetlinkPayload::InnerMessage(RouteNetlinkMessage::NewRoute(rt_msg)),
+                )
+            })
+            .chain([main])
+            .collect();
+
+        let mut pending = VecDeque::new();
+        enqueue_route_changes(messages, &mut pending).unwrap();
+
+        assert_eq!(pending.len(), 1);
+        assert_eq!(
+            pending[0].1.destination,
+            IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1))
+        );
+    }
+
+    #[test]
+    fn default_route_candidates_follow_selectors_and_metric() {
+        let gateway = Ipv4Addr::new(192, 168, 1, 1);
+        let any = Route::default();
+
+        let (metric, route) =
+            default_route_candidate(&default_route(gateway, 2, Some(100)), &any).unwrap();
+        assert_eq!(metric, 100);
+        assert_eq!(route.destination, IpAddr::V4(Ipv4Addr::UNSPECIFIED));
+        assert_eq!(route.prefix, 0);
+        assert_eq!(route.gateway, Some(IpAddr::V4(gateway)));
+        assert_eq!(route.ifindex, Some(2));
+        assert_eq!(
+            default_route_candidate(&default_route(gateway, 2, None), &any)
+                .unwrap()
+                .0,
+            0
+        );
+
+        assert!(
+            default_route_candidate(&default_route(gateway, 2, None), &any.clone().ifindex(3))
+                .is_none()
+        );
+        let mut dead = default_route(gateway, 2, None);
+        dead.header.flags = RouteFlags::Dead;
+        assert!(default_route_candidate(&dead, &any).is_none());
+        let mut host = default_route(gateway, 2, None);
+        host.header.destination_prefix_length = 32;
+        assert!(default_route_candidate(&host, &any).is_none());
+    }
+
+    #[test]
     fn delete_message_keeps_nowhere_scope_and_includes_selectors() {
         let route = Route::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 0)), 24)
             .gateway(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)))
@@ -651,6 +846,33 @@ mod tests {
         let route = socket.get(&Route::default()).unwrap();
 
         assert!(matches!(socket.mode, SocketMode::Command(port_id) if port_id != 0));
-        assert!(route.destination.is_ipv4());
+        assert_eq!(route.destination, IpAddr::V4(Ipv4Addr::UNSPECIFIED));
+        assert_eq!(route.prefix, 0);
+        assert!(route.ifindex.is_some());
+        assert_ne!(route.ifindex, crate::if_nametoindex("lo"));
+    }
+
+    #[test]
+    #[ignore = "requires CAP_NET_ADMIN and temporarily installs a reserved test route"]
+    fn add_get_delete_round_trip_through_the_main_table() {
+        let lo = crate::if_nametoindex("lo").unwrap();
+        let route = Route::new(IpAddr::V4(Ipv4Addr::new(198, 18, 255, 0)), 24).ifindex(lo);
+        let mut socket = RouteSock::new().unwrap();
+
+        socket.add(&route).unwrap();
+        let duplicate = socket.add(&route);
+        let found = socket.get(&Route::new(IpAddr::V4(Ipv4Addr::new(198, 18, 255, 7)), 32));
+        let cleanup = socket.delete(&route);
+
+        cleanup.unwrap();
+        assert_eq!(duplicate.unwrap_err().raw_os_error(), Some(libc::EEXIST));
+        let found = found.unwrap();
+        assert_eq!(found.destination, route.destination);
+        assert_eq!(found.prefix, 24);
+        assert_eq!(found.ifindex, Some(lo));
+        assert_eq!(
+            socket.delete(&route).unwrap_err().raw_os_error(),
+            Some(libc::ESRCH)
+        );
     }
 }

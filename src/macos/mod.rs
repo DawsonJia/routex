@@ -51,13 +51,16 @@ impl Write for RouteSock {
 
 impl Read for RouteSock {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        let n = syscall!(read(
-            self.as_raw_fd(),
-            buf.as_mut_ptr() as *mut _,
-            buf.len()
-        ))?;
-
-        Ok(n as usize)
+        loop {
+            match syscall!(read(
+                self.as_raw_fd(),
+                buf.as_mut_ptr() as *mut _,
+                buf.len()
+            )) {
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+                result => return result.map(|n| n as usize),
+            }
+        }
     }
 }
 
@@ -136,8 +139,10 @@ impl RouteAction for RouteSock {
 
             let mut rtmsg = m_rtmsg::parse(&buf[..n])?;
             validate_header(&rtmsg.hdr, None)?;
+            // XNU broadcasts a failed request too, with its errno: some
+            // process's error, and no change to the table.
             if rtmsg.hdr.rtm_errno != 0 {
-                return Err(code2error(rtmsg.hdr.rtm_errno));
+                continue;
             }
 
             let change: RouteChange = rtmsg.hdr.rtm_type.into();
@@ -271,8 +276,13 @@ fn write_route_addrs(route: &Route, kind: RouteRequestKind) -> m_rtmsg {
         rtmsg.hdr.rtm_addrs |= RTA_GATEWAY;
     }
     // Query asks the kernel to fill in IFP, so the slot must be reserved
-    // even when the caller does not yet know the ifindex.
-    if matches!(kind, RouteRequestKind::Query) {
+    // even when the caller does not yet know the ifindex. An add through a
+    // gateway names its interface the same way (`route add ... -ifp`).
+    if matches!(kind, RouteRequestKind::Query)
+        || matches!(kind, RouteRequestKind::Add)
+            && route.gateway.is_some()
+            && route.ifindex.is_some()
+    {
         rtmsg.hdr.rtm_addrs |= RTA_IFP;
     }
 
@@ -466,6 +476,20 @@ mod tests {
         let rtmsg = write_route_addrs(&route, RouteRequestKind::Add);
 
         assert_eq!(rtmsg.hdr.rtm_addrs, RTA_DST | RTA_GATEWAY | RTA_NETMASK);
+    }
+
+    #[test]
+    fn add_by_gateway_and_interface_sends_ifp() {
+        let route = Route::new(IpAddr::V4(Ipv4Addr::new(1, 9, 4, 5)), 32)
+            .gateway(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)))
+            .ifindex(4);
+
+        let rtmsg = write_route_addrs(&route, RouteRequestKind::Add);
+
+        assert_eq!(
+            rtmsg.hdr.rtm_addrs,
+            RTA_DST | RTA_GATEWAY | RTA_NETMASK | RTA_IFP
+        );
     }
 
     #[test]

@@ -40,22 +40,14 @@ pub struct Route {
     /// is only matched by lookups whose `IP_BOUND_IF` scope equals this
     /// ifindex. Used to install a per-interface copy of the default route so
     /// that physical-NIC-bound sockets can still reach the internet after a
-    /// VPN's `0/1` + `128/1` routes have taken the unscoped default. Linux
-    /// and Windows backends ignore this field.
+    /// VPN's `0/1` + `128/1` routes have taken the unscoped default.
+    #[cfg(target_os = "macos")]
     pub scope_ifindex: Option<u32>,
 }
 
 impl Default for Route {
     fn default() -> Self {
-        use std::net::Ipv4Addr;
-
-        Route {
-            destination: IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0)),
-            prefix: 0,
-            gateway: None,
-            ifindex: None,
-            scope_ifindex: None,
-        }
+        Route::new(IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED), 0)
     }
 }
 
@@ -66,6 +58,7 @@ impl Route {
             prefix,
             gateway: None,
             ifindex: None,
+            #[cfg(target_os = "macos")]
             scope_ifindex: None,
         }
     }
@@ -122,12 +115,6 @@ impl Route {
         Ok(())
     }
 
-    #[cfg(target_os = "linux")]
-    pub fn via(mut self, gateway: IpAddr) -> Route {
-        self.gateway = Some(gateway);
-        self
-    }
-
     pub fn gateway(mut self, gateway: IpAddr) -> Route {
         self.gateway = Some(gateway);
         self
@@ -138,23 +125,10 @@ impl Route {
         self
     }
 
-    /// macOS-only: scope this route to a specific interface (`RTF_IFSCOPE`).
-    /// No-op on Linux/Windows backends.
+    /// Scope this route to a specific interface (`RTF_IFSCOPE`).
     #[cfg(target_os = "macos")]
     pub fn ifscope(mut self, ifindex: u32) -> Route {
         self.scope_ifindex = Some(ifindex);
-        self
-    }
-
-    #[cfg(any(target_os = "macos", target_os = "windows"))]
-    pub fn interface(mut self, interface: &str) -> Route {
-        self.ifindex = if_nametoindex(interface);
-        self
-    }
-
-    #[cfg(target_os = "linux")]
-    pub fn dev(mut self, interface: &str) -> Route {
-        self.ifindex = if_nametoindex(interface);
         self
     }
 }
