@@ -16,6 +16,8 @@ macro_rules! syscall {
     }};
 }
 
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+mod fd;
 #[cfg(target_os = "linux")]
 mod linux;
 #[cfg(target_os = "macos")]
@@ -24,13 +26,13 @@ mod macos;
 mod windows;
 
 #[cfg(target_os = "linux")]
-pub use linux::RouteSock;
+pub use linux::{RouteMonitor, RouteSock};
 #[cfg(target_os = "macos")]
-pub use macos::RouteSock;
+pub use macos::{RouteMonitor, RouteSock};
 #[cfg(target_os = "windows")]
-pub use windows::RouteSock;
+pub use windows::{RouteSock, if_friendly_name_to_index};
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Route {
     pub destination: IpAddr,
     pub prefix: u8,
@@ -133,30 +135,14 @@ impl Route {
     }
 }
 
-#[derive(Debug)]
+/// A change to the routing table, as reported by [`RouteMonitor`].
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum RouteChange {
-    ADD,
-    DELETE,
-    CHANGE,
-    OTHER(u8),
-}
-
-impl From<u8> for RouteChange {
-    fn from(value: u8) -> Self {
-        match value {
-            1 => RouteChange::ADD,
-            2 => RouteChange::DELETE,
-            3 => RouteChange::CHANGE,
-            _ => RouteChange::OTHER(value),
-        }
-    }
-}
-
-pub trait RouteAction {
-    fn add(&mut self, route: &Route) -> io::Result<()>;
-    fn delete(&mut self, route: &Route) -> io::Result<()>;
-    fn get(&mut self, route: &Route) -> io::Result<Route>;
-    fn monitor(&mut self, buf: &mut [u8]) -> io::Result<(RouteChange, Route)>;
+    Add,
+    Delete,
+    /// An existing route got a new gateway, interface or metrics (macOS).
+    Change,
 }
 
 pub fn if_nametoindex(name: &str) -> Option<u32> {
@@ -171,11 +157,6 @@ pub fn if_nametoindex(name: &str) -> Option<u32> {
     };
 
     (ifindex != 0).then_some(ifindex)
-}
-
-#[cfg(target_os = "windows")]
-pub fn if_friendly_name_to_index(name: &str) -> Option<u32> {
-    windows::if_friendly_name_to_index(name)
 }
 
 #[cfg(test)]

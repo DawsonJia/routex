@@ -1,21 +1,14 @@
-use routex::{RouteAction, RouteSock};
-
-fn main() {
-    let mut handle = RouteSock::new().unwrap();
-
-    #[cfg(target_os = "linux")]
-    handle.subscribe().unwrap();
-
-    let mut buf = RouteSock::new_buf();
+#[cfg(not(target_os = "windows"))]
+fn main() -> std::io::Result<()> {
+    let mut monitor = routex::RouteMonitor::new()?;
 
     loop {
-        let ret = handle.monitor(&mut buf).unwrap();
-        println!("{:?}", ret);
-        if let routex::RouteChange::ADD = ret.0 {
-            let route = ret.1;
-            if route.destination.is_unspecified() {
-                println!("default route added: {:?}", route);
-            }
-        }
+        let (change, route) = monitor.recv()?;
+        println!("{change:?} {route:?}");
     }
+}
+
+#[cfg(target_os = "windows")]
+fn main() {
+    eprintln!("route monitoring is not implemented on Windows");
 }

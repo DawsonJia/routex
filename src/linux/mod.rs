@@ -1,10 +1,9 @@
 use std::{
     collections::VecDeque,
-    io::{self, Read, Write},
+    io,
     net::IpAddr,
     num::NonZeroI32,
-    os::fd::{AsRawFd, RawFd},
-    sync::atomic::{AtomicU32, Ordering},
+    os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd, RawFd},
 };
 
 use libc::{
@@ -23,138 +22,48 @@ use netlink_packet_route::{
     },
 };
 
-use crate::{Route, RouteAction, RouteChange};
+use crate::{Route, RouteChange, fd};
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum SocketMode {
-    Fresh,
-    Command(u32),
-    Monitor,
+/// Holds any datagram: the kernel sizes a dump datagram to the larger of
+/// 8 KiB and the reader's buffer.
+const RECV_BUF_LEN: usize = 16384;
+
+/// A netlink socket that changes and queries the main routing table.
+pub struct RouteSock {
+    fd: OwnedFd,
+    port_id: u32,
+    sequence: u32,
 }
 
-pub struct RouteSock {
-    fd: RawFd,
-    sequence: AtomicU32,
-    mode: SocketMode,
-    pending_changes: VecDeque<(RouteChange, Route)>,
+impl AsFd for RouteSock {
+    fn as_fd(&self) -> BorrowedFd<'_> {
+        self.fd.as_fd()
+    }
 }
 
 impl AsRawFd for RouteSock {
     fn as_raw_fd(&self) -> RawFd {
-        self.fd
+        self.fd.as_raw_fd()
     }
 }
 
 impl RouteSock {
     pub fn new() -> io::Result<Self> {
-        let fd = syscall!(socket(AF_NETLINK, SOCK_RAW | SOCK_CLOEXEC, NETLINK_ROUTE))?;
+        let fd = socket()?;
+        bind(fd.as_fd(), 0)?;
+        let port_id = port_id(fd.as_fd())?;
 
         Ok(Self {
             fd,
-            sequence: AtomicU32::new(0),
-            mode: SocketMode::Fresh,
-            pending_changes: VecDeque::new(),
+            port_id,
+            sequence: 0,
         })
     }
 
-    fn bind(&mut self, local: sockaddr_nl) -> io::Result<()> {
-        syscall!(bind(
-            self.as_raw_fd(),
-            &local as *const sockaddr_nl as *const _,
-            std::mem::size_of::<sockaddr_nl>() as _
-        ))?;
-
-        Ok(())
-    }
-
-    fn bind_command(&mut self) -> io::Result<u32> {
-        let mut local = unsafe { std::mem::zeroed::<sockaddr_nl>() };
-        local.nl_family = AF_NETLINK as u16;
-        self.bind(local)?;
-
-        let mut assigned = unsafe { std::mem::zeroed::<sockaddr_nl>() };
-        let mut assigned_len = std::mem::size_of::<sockaddr_nl>() as libc::socklen_t;
-        syscall!(getsockname(
-            self.as_raw_fd(),
-            (&mut assigned as *mut sockaddr_nl).cast(),
-            &mut assigned_len
-        ))?;
-        if assigned_len < std::mem::size_of::<sockaddr_nl>() as libc::socklen_t
-            || assigned.nl_family != AF_NETLINK as u16
-            || assigned.nl_pid == 0
-        {
-            return Err(io::Error::other(
-                "kernel assigned an invalid netlink address",
-            ));
-        }
-
-        Ok(assigned.nl_pid)
-    }
-
-    pub fn subscribe(&mut self) -> io::Result<()> {
-        match self.mode {
-            SocketMode::Fresh => {}
-            SocketMode::Monitor => return Ok(()),
-            SocketMode::Command(_) => {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "a command netlink socket cannot become a route monitor",
-                ));
-            }
-        }
-
-        let mut local = unsafe { std::mem::zeroed::<sockaddr_nl>() };
-        local.nl_family = AF_NETLINK as u16;
-        local.nl_groups = nl_mgrp(RTNLGRP_IPV4_ROUTE) | nl_mgrp(RTNLGRP_IPV6_ROUTE);
-
-        self.bind(local)?;
-        self.mode = SocketMode::Monitor;
-        Ok(())
-    }
-
-    pub fn new_buf() -> [u8; 16384] {
-        [0u8; 16384]
-    }
-}
-
-impl Write for RouteSock {
-    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        let n = syscall!(write(self.as_raw_fd(), buf.as_ptr() as *const _, buf.len()))?;
-
-        Ok(n as usize)
-    }
-
-    fn flush(&mut self) -> io::Result<()> {
-        Ok(())
-    }
-}
-
-impl Read for RouteSock {
-    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        loop {
-            match syscall!(read(
-                self.as_raw_fd(),
-                buf.as_mut_ptr() as *mut _,
-                buf.len()
-            )) {
-                Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
-                result => return result.map(|n| n as usize),
-            }
-        }
-    }
-}
-
-impl Drop for RouteSock {
-    fn drop(&mut self) {
-        let _ = syscall!(close(self.fd));
-    }
-}
-
-impl RouteAction for RouteSock {
-    fn add(&mut self, route: &Route) -> io::Result<()> {
+    pub fn add(&mut self, route: &Route) -> io::Result<()> {
         route.validate()?;
 
-        let (sequence, port_id) = self.next_command_sequence()?;
+        let (sequence, port_id) = (self.next_sequence(), self.port_id);
         let mut nl_hdr = NetlinkHeader::default();
         nl_hdr.flags = NLM_F_REQUEST | NLM_F_EXCL | NLM_F_CREATE | NLM_F_ACK;
         nl_hdr.sequence_number = sequence;
@@ -179,14 +88,14 @@ impl RouteAction for RouteSock {
 
         let mut buf = [0u8; 4096];
         req.serialize(&mut buf[..req.buffer_len()]);
-        self.write_all(&buf[..req.buffer_len()])?;
+        fd::send(self.fd.as_fd(), &buf[..req.buffer_len()])?;
         self.recv_ack(sequence, port_id)
     }
 
-    fn delete(&mut self, route: &Route) -> io::Result<()> {
+    pub fn delete(&mut self, route: &Route) -> io::Result<()> {
         route.validate()?;
 
-        let (sequence, port_id) = self.next_command_sequence()?;
+        let (sequence, port_id) = (self.next_sequence(), self.port_id);
         let mut nl_hdr = NetlinkHeader::default();
         nl_hdr.flags = NLM_F_REQUEST | NLM_F_ACK;
         nl_hdr.sequence_number = sequence;
@@ -205,11 +114,11 @@ impl RouteAction for RouteSock {
 
         let mut buf = [0u8; 4096];
         req.serialize(&mut buf[..req.buffer_len()]);
-        self.write_all(&buf[..req.buffer_len()])?;
+        fd::send(self.fd.as_fd(), &buf[..req.buffer_len()])?;
         self.recv_ack(sequence, port_id)
     }
 
-    fn get(&mut self, route: &Route) -> io::Result<Route> {
+    pub fn get(&mut self, route: &Route) -> io::Result<Route> {
         route.validate()?;
 
         // The kernel answers a lookup of the unspecified address with the
@@ -218,7 +127,7 @@ impl RouteAction for RouteSock {
             return self.default_route(route);
         }
 
-        let (sequence, port_id) = self.next_command_sequence()?;
+        let (sequence, port_id) = (self.next_sequence(), self.port_id);
         let mut nl_hdr = NetlinkHeader::default();
         nl_hdr.flags = NLM_F_REQUEST;
         nl_hdr.sequence_number = sequence;
@@ -233,60 +142,20 @@ impl RouteAction for RouteSock {
         req.finalize();
         let mut buf = [0u8; 4096];
         req.serialize(&mut buf[..req.buffer_len()]);
-        self.write_all(&buf[..req.buffer_len()])?;
+        fd::send(self.fd.as_fd(), &buf[..req.buffer_len()])?;
 
         self.recv_route_response(sequence, port_id)
     }
 
-    fn monitor(&mut self, buf: &mut [u8]) -> io::Result<(RouteChange, Route)> {
-        if !matches!(self.mode, SocketMode::Monitor) {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "call subscribe before monitoring route changes",
-            ));
-        }
-
-        loop {
-            if let Some(change) = self.pending_changes.pop_front() {
-                return Ok(change);
-            }
-
-            let n = self.read(buf)?;
-            enqueue_route_changes(parse_nlmsgs(&buf[..n])?, &mut self.pending_changes)?;
-        }
-    }
-}
-
-impl RouteSock {
-    fn next_command_sequence(&mut self) -> io::Result<(u32, u32)> {
-        let port_id = match self.mode {
-            SocketMode::Fresh => {
-                let port_id = self.bind_command()?;
-                self.mode = SocketMode::Command(port_id);
-                port_id
-            }
-            SocketMode::Command(port_id) => port_id,
-            SocketMode::Monitor => {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "route commands require a non-subscribed netlink socket",
-                ));
-            }
-        };
-
-        let previous = self
-            .sequence
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |sequence| {
-                Some(sequence.wrapping_add(1).max(1))
-            })
-            .expect("sequence update closure always returns Some");
-        Ok((previous.wrapping_add(1).max(1), port_id))
+    fn next_sequence(&mut self) -> u32 {
+        self.sequence = self.sequence.wrapping_add(1).max(1);
+        self.sequence
     }
 
     fn recv_route_response(&mut self, sequence: u32, port_id: u32) -> io::Result<Route> {
         loop {
-            let mut rbuf = [0u8; 16384];
-            let n = self.read(&mut rbuf)?;
+            let mut rbuf = [0u8; RECV_BUF_LEN];
+            let n = fd::recv(self.fd.as_fd(), &mut rbuf)?;
             for nlmsg in parse_nlmsgs(&rbuf[..n])? {
                 if !response_matches(&nlmsg.header, sequence, port_id) {
                     continue;
@@ -318,7 +187,7 @@ impl RouteSock {
     }
 
     fn default_route(&mut self, route: &Route) -> io::Result<Route> {
-        let (sequence, port_id) = self.next_command_sequence()?;
+        let (sequence, port_id) = (self.next_sequence(), self.port_id);
         let mut nl_hdr = NetlinkHeader::default();
         nl_hdr.flags = NLM_F_REQUEST | NLM_F_DUMP;
         nl_hdr.sequence_number = sequence;
@@ -334,12 +203,12 @@ impl RouteSock {
         req.finalize();
         let mut buf = [0u8; 4096];
         req.serialize(&mut buf[..req.buffer_len()]);
-        self.write_all(&buf[..req.buffer_len()])?;
+        fd::send(self.fd.as_fd(), &buf[..req.buffer_len()])?;
 
         let mut best: Option<(u32, Route)> = None;
         loop {
-            let mut rbuf = [0u8; 16384];
-            let n = self.read(&mut rbuf)?;
+            let mut rbuf = [0u8; RECV_BUF_LEN];
+            let n = fd::recv(self.fd.as_fd(), &mut rbuf)?;
             for nlmsg in parse_nlmsgs(&rbuf[..n])? {
                 if !response_matches(&nlmsg.header, sequence, port_id) {
                     continue;
@@ -378,13 +247,99 @@ impl RouteSock {
 
     fn recv_ack(&mut self, sequence: u32, port_id: u32) -> io::Result<()> {
         loop {
-            let mut rbuf = [0u8; 4096];
-            let n = self.read(&mut rbuf)?;
+            let mut rbuf = [0u8; RECV_BUF_LEN];
+            let n = fd::recv(self.fd.as_fd(), &mut rbuf)?;
             if let Some(result) = ack_from_messages(&parse_nlmsgs(&rbuf[..n])?, sequence, port_id) {
                 return result;
             }
         }
     }
+}
+
+/// A netlink socket that reports the changes to the main routing table.
+pub struct RouteMonitor {
+    fd: OwnedFd,
+    buf: Box<[u8]>,
+    pending: VecDeque<(RouteChange, Route)>,
+}
+
+impl AsFd for RouteMonitor {
+    fn as_fd(&self) -> BorrowedFd<'_> {
+        self.fd.as_fd()
+    }
+}
+
+impl AsRawFd for RouteMonitor {
+    fn as_raw_fd(&self) -> RawFd {
+        self.fd.as_raw_fd()
+    }
+}
+
+impl RouteMonitor {
+    pub fn new() -> io::Result<Self> {
+        const ROUTE_GROUPS: u32 = nl_mgrp(RTNLGRP_IPV4_ROUTE) | nl_mgrp(RTNLGRP_IPV6_ROUTE);
+
+        let fd = socket()?;
+        bind(fd.as_fd(), ROUTE_GROUPS)?;
+
+        Ok(Self {
+            fd,
+            buf: vec![0; RECV_BUF_LEN].into_boxed_slice(),
+            pending: VecDeque::new(),
+        })
+    }
+
+    /// Blocks until the next change to the main routing table.
+    pub fn recv(&mut self) -> io::Result<(RouteChange, Route)> {
+        loop {
+            if let Some(change) = self.pending.pop_front() {
+                return Ok(change);
+            }
+
+            let n = fd::recv(self.fd.as_fd(), &mut self.buf)?;
+            enqueue_route_changes(parse_nlmsgs(&self.buf[..n])?, &mut self.pending)?;
+        }
+    }
+}
+
+fn socket() -> io::Result<OwnedFd> {
+    let fd = syscall!(socket(AF_NETLINK, SOCK_RAW | SOCK_CLOEXEC, NETLINK_ROUTE))?;
+
+    Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+}
+
+fn bind(fd: BorrowedFd<'_>, groups: u32) -> io::Result<()> {
+    let mut local = unsafe { std::mem::zeroed::<sockaddr_nl>() };
+    local.nl_family = AF_NETLINK as u16;
+    local.nl_groups = groups;
+    syscall!(bind(
+        fd.as_raw_fd(),
+        (&local as *const sockaddr_nl).cast(),
+        std::mem::size_of::<sockaddr_nl>() as _
+    ))?;
+
+    Ok(())
+}
+
+/// The port the kernel assigned to `fd` when it was bound.
+fn port_id(fd: BorrowedFd<'_>) -> io::Result<u32> {
+    let mut assigned = unsafe { std::mem::zeroed::<sockaddr_nl>() };
+    let mut assigned_len = std::mem::size_of::<sockaddr_nl>() as libc::socklen_t;
+    syscall!(getsockname(
+        fd.as_raw_fd(),
+        (&mut assigned as *mut sockaddr_nl).cast(),
+        &mut assigned_len
+    ))?;
+    if assigned_len < std::mem::size_of::<sockaddr_nl>() as libc::socklen_t
+        || assigned.nl_family != AF_NETLINK as u16
+        || assigned.nl_pid == 0
+    {
+        return Err(io::Error::other(
+            "kernel assigned an invalid netlink address",
+        ));
+    }
+
+    Ok(assigned.nl_pid)
 }
 
 fn netlink_error(code: NonZeroI32) -> io::Error {
@@ -568,10 +523,10 @@ fn enqueue_route_changes(
     for message in messages {
         let (change, rt_msg) = match message.payload {
             NetlinkPayload::InnerMessage(RouteNetlinkMessage::NewRoute(rt_msg)) => {
-                (RouteChange::ADD, rt_msg)
+                (RouteChange::Add, rt_msg)
             }
             NetlinkPayload::InnerMessage(RouteNetlinkMessage::DelRoute(rt_msg)) => {
-                (RouteChange::DELETE, rt_msg)
+                (RouteChange::Delete, rt_msg)
             }
             NetlinkPayload::Error(error) => {
                 if let Some(code) = error.code {
@@ -746,10 +701,10 @@ mod tests {
         enqueue_route_changes(parsed, &mut pending).unwrap();
 
         let (change, route) = pending.pop_front().unwrap();
-        assert!(matches!(change, RouteChange::ADD));
+        assert_eq!(change, RouteChange::Add);
         assert_eq!(route.destination, IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)));
         let (change, route) = pending.pop_front().unwrap();
-        assert!(matches!(change, RouteChange::DELETE));
+        assert_eq!(change, RouteChange::Delete);
         assert_eq!(route.destination, IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)));
         assert!(pending.is_empty());
     }
@@ -806,8 +761,7 @@ mod tests {
         );
 
         assert!(
-            default_route_candidate(&default_route(gateway, 2, None), &any.clone().ifindex(3))
-                .is_none()
+            default_route_candidate(&default_route(gateway, 2, None), &any.ifindex(3)).is_none()
         );
         let mut dead = default_route(gateway, 2, None);
         dead.header.flags = RouteFlags::Dead;
@@ -840,12 +794,11 @@ mod tests {
 
     #[test]
     #[ignore = "black-box check against the live Linux routing table"]
-    fn default_route_lookup_matches_the_bound_command_socket() {
+    fn default_route_lookup_returns_the_default_route() {
         let mut socket = RouteSock::new().unwrap();
 
         let route = socket.get(&Route::default()).unwrap();
 
-        assert!(matches!(socket.mode, SocketMode::Command(port_id) if port_id != 0));
         assert_eq!(route.destination, IpAddr::V4(Ipv4Addr::UNSPECIFIED));
         assert_eq!(route.prefix, 0);
         assert!(route.ifindex.is_some());
@@ -874,5 +827,26 @@ mod tests {
             socket.delete(&route).unwrap_err().raw_os_error(),
             Some(libc::ESRCH)
         );
+    }
+
+    #[test]
+    #[ignore = "requires CAP_NET_ADMIN and temporarily installs a reserved test route"]
+    fn monitor_reports_an_added_and_deleted_route() {
+        let lo = crate::if_nametoindex("lo").unwrap();
+        let route = Route::new(IpAddr::V4(Ipv4Addr::new(198, 18, 254, 0)), 24).ifindex(lo);
+        let mut monitor = RouteMonitor::new().unwrap();
+        let mut socket = RouteSock::new().unwrap();
+
+        socket.add(&route).unwrap();
+        socket.delete(&route).unwrap();
+
+        let mut next = || loop {
+            let change = monitor.recv().unwrap();
+            if change.1.destination == route.destination {
+                return change;
+            }
+        };
+        assert_eq!(next(), (RouteChange::Add, route));
+        assert_eq!(next(), (RouteChange::Delete, route));
     }
 }

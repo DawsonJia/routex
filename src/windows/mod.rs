@@ -22,8 +22,10 @@ use windows_sys::Win32::{
     },
 };
 
-use crate::{Route, RouteAction, RouteChange};
+use crate::Route;
 
+/// Changes and queries the routing table through the IP Helper API.
+// TODO: a `RouteMonitor` backed by NotifyRouteChange2.
 pub struct RouteSock;
 
 impl RouteSock {
@@ -31,14 +33,7 @@ impl RouteSock {
         Ok(Self)
     }
 
-    pub fn new_buf() -> [u8; 0] {
-        // TODO: replace this placeholder when monitor is backed by NotifyRouteChange2.
-        []
-    }
-}
-
-impl RouteAction for RouteSock {
-    fn add(&mut self, route: &Route) -> io::Result<()> {
+    pub fn add(&mut self, route: &Route) -> io::Result<()> {
         route.validate()?;
 
         let mut row = route_row(route);
@@ -46,14 +41,14 @@ impl RouteAction for RouteSock {
         win32_result(unsafe { CreateIpForwardEntry2(&row) })
     }
 
-    fn delete(&mut self, route: &Route) -> io::Result<()> {
+    pub fn delete(&mut self, route: &Route) -> io::Result<()> {
         route.validate()?;
 
         let row = find_unique_route(route)?;
         win32_result(unsafe { DeleteIpForwardEntry2(&row) })
     }
 
-    fn get(&mut self, route: &Route) -> io::Result<Route> {
+    pub fn get(&mut self, route: &Route) -> io::Result<Route> {
         route.validate()?;
 
         // GetBestRoute2 treats an unspecified destination as a lookup target, not as "show default route".
@@ -65,17 +60,11 @@ impl RouteAction for RouteSock {
 
         route_from_row(&row)
     }
-
-    fn monitor(&mut self, _buf: &mut [u8]) -> io::Result<(RouteChange, Route)> {
-        // TODO: implement this with NotifyRouteChange2 and an internal event queue.
-        Err(io::Error::new(
-            io::ErrorKind::Unsupported,
-            "Windows route monitoring is not implemented",
-        ))
-    }
 }
 
-pub(crate) fn if_friendly_name_to_index(name: &str) -> Option<u32> {
+/// The index of the adapter whose friendly name, as shown in the network
+/// settings, is `name`, ignoring case.
+pub fn if_friendly_name_to_index(name: &str) -> Option<u32> {
     let table = AdapterAddressTable::new().ok()?;
     let target = name.to_lowercase();
 
