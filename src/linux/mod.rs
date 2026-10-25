@@ -306,6 +306,8 @@ fn change_message(route: &Route) -> RouteMessage {
     rt_msg
 }
 
+// TODO: a multipath route keeps its gateways and interfaces in
+// RTA_MULTIPATH, so it reads back without either.
 fn route_from_message(rt_msg: &RouteMessage) -> Option<Route> {
     let mut route = Route::new(
         unspecified(rt_msg.header.address_family),

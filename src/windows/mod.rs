@@ -299,6 +299,8 @@ fn address_family(addr: IpAddr) -> ADDRESS_FAMILY {
     }
 }
 
+// TODO: keep the raw code in AlreadyExists and NotFound as well, so that
+// `raw_os_error` works as it does on Linux and macOS.
 fn win32_result(code: u32) -> io::Result<()> {
     match code {
         ERROR_SUCCESS => Ok(()),
