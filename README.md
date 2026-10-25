@@ -46,6 +46,9 @@ settings.
   next hop that `gateway` and `ifindex` select; one with several such next
   hops, or with a nexthop object the kernel does not expand, is an error, as a
   `Route` holds a single next hop.
+- A `Route` holds a gateway of the family of its destination, so on Linux a
+  route through a gateway of another family, an IPv4 route through an IPv6
+  one, is an error for `get` and skipped by `RouteMonitor`.
 - On Linux, `add`, `delete` and `RouteMonitor` work on the main table only. The
   monitor reports every route of it, blackholes included; a multipath route
   without its gateways and interfaces.

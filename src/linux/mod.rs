@@ -18,7 +18,7 @@ use netlink_packet_route::{
     AddressFamily, RouteNetlinkMessage,
     route::{
         RouteAddress, RouteAttribute, RouteFlags, RouteHeader, RouteMessage, RouteNextHopFlags,
-        RouteProtocol, RouteScope, RouteType,
+        RouteProtocol, RouteScope, RouteType, RouteVia,
     },
 };
 
@@ -115,9 +115,8 @@ impl RouteSock {
         self.replies(sequence, |message| {
             Some(match message.payload {
                 NetlinkPayload::InnerMessage(RouteNetlinkMessage::NewRoute(rt_msg)) => {
-                    route_from_message(&rt_msg).ok_or_else(|| {
-                        io::Error::new(io::ErrorKind::InvalidData, "non-IP route reply")
-                    })
+                    route_from_message(&rt_msg)
+                        .map_err(|reason| io::Error::new(io::ErrorKind::Unsupported, reason))
                 }
                 payload => Err(unexpected_reply(payload)),
             })
@@ -325,25 +324,61 @@ fn change_message(route: &Route) -> RouteMessage {
     rt_msg
 }
 
-// TODO: a multipath route keeps its gateways and interfaces in
-// RTA_MULTIPATH, and with `nexthop_compat_mode` off a route only names its
-// nexthop object: a monitor reports either without them.
-fn route_from_message(rt_msg: &RouteMessage) -> Option<Route> {
-    let mut route = Route::new(
-        unspecified(rt_msg.header.address_family),
-        rt_msg.header.destination_prefix_length,
-    );
+/// A next hop: its gateway, none when on-link, and its interface. The
+/// gateway is an error when a `Route` cannot hold it.
+type NextHop = (Result<Option<IpAddr>, &'static str>, Option<u32>);
 
+/// `rt_msg` as a route, or why a `Route` cannot hold it.
+fn route_from_message(rt_msg: &RouteMessage) -> Result<Route, &'static str> {
+    let (entry, (gateway, ifindex)) = parse_route(rt_msg)?;
+
+    Ok(Route {
+        gateway: gateway?,
+        ifindex,
+        ..entry
+    })
+}
+
+/// The destination of `rt_msg`, as a route through no next hop, and the next
+/// hop that its own attributes name, as against those in RTA_MULTIPATH.
+fn parse_route(rt_msg: &RouteMessage) -> Result<(Route, NextHop), &'static str> {
+    let family = rt_msg.header.address_family;
+    let mut entry = Route::new(unspecified(family), rt_msg.header.destination_prefix_length);
+    let mut ifindex = None;
     for attr in &rt_msg.attributes {
         match attr {
-            RouteAttribute::Destination(addr) => route.destination = ip_addr(addr)?,
-            RouteAttribute::Gateway(addr) => route.gateway = Some(ip_addr(addr)?),
-            RouteAttribute::Oif(index) => route.ifindex = Some(*index),
+            RouteAttribute::Destination(addr) => {
+                entry.destination = ip_addr(addr).ok_or("the destination is not an IP address")?;
+            }
+            RouteAttribute::Oif(index) => ifindex = Some(*index),
             _ => {}
         }
     }
 
-    Some(route)
+    Ok((entry, next_hop(&rt_msg.attributes, ifindex, family)))
+}
+
+/// The next hop out of `ifindex` through the gateway in `attrs`, for a route
+/// of `family`.
+fn next_hop(attrs: &[RouteAttribute], ifindex: Option<u32>, family: AddressFamily) -> NextHop {
+    let mut gateway = Ok(None);
+    for attr in attrs {
+        let address = match attr {
+            RouteAttribute::Gateway(addr) => ip_addr(addr),
+            // An IPv4 route through an IPv6 gateway (RFC 5549).
+            RouteAttribute::Via(RouteVia::Inet(addr)) => Some(IpAddr::V4(*addr)),
+            RouteAttribute::Via(RouteVia::Inet6(addr)) => Some(IpAddr::V6(*addr)),
+            RouteAttribute::Via(_) => None,
+            _ => continue,
+        };
+        // A `Route` holds a gateway of the family of its destination.
+        gateway = address
+            .filter(|address| address_family(*address) == family)
+            .map(Some)
+            .ok_or("the gateway is not an address of the family of the destination");
+    }
+
+    (gateway, ifindex)
 }
 
 /// Whether `rt_msg` is a route of the main table, the only table this crate
@@ -390,46 +425,38 @@ fn default_route_candidate(
             _ => None,
         })
         .unwrap_or(0);
-    let entry = route_from_message(rt_msg)?;
+    let Ok((entry, own_next_hop)) = parse_route(rt_msg) else {
+        return None;
+    };
     let multipath = rt_msg.attributes.iter().find_map(|attr| match attr {
         RouteAttribute::MultiPath(hops) => Some(hops),
         _ => None,
     });
-    let next_hops: Vec<(Option<IpAddr>, Option<u32>)> = match multipath {
-        Some(hops) => hops
-            .iter()
-            // The kernel takes no dead next hop.
-            .filter(|hop| !hop.flags.contains(RouteNextHopFlags::Dead))
-            .map(|hop| {
-                let gateway = hop.attributes.iter().find_map(|attr| match attr {
-                    RouteAttribute::Gateway(addr) => ip_addr(addr),
-                    _ => None,
-                });
-                (gateway, Some(hop.interface_index))
-            })
-            .collect(),
-        // With `nexthop_compat_mode` off, a route only names its nexthop
-        // object, so neither its next hops nor whether they match are known.
-        None if entry.gateway.is_none()
-            && entry.ifindex.is_none()
-            && uses_nexthop_object(rt_msg) =>
-        {
-            return Some((metric, Err("the default route uses a nexthop object")));
-        }
-        None => vec![(entry.gateway, entry.ifindex)],
-    };
+    // With `nexthop_compat_mode` off, a route only names its nexthop object,
+    // so neither its next hops nor whether they match are known.
+    if multipath.is_none() && own_next_hop == (Ok(None), None) && uses_nexthop_object(rt_msg) {
+        return Some((metric, Err("the default route uses a nexthop object")));
+    }
 
-    let mut selected = next_hops.into_iter().filter(|&(gateway, ifindex)| {
+    let family = rt_msg.header.address_family;
+    let next_hops = multipath
+        .into_iter()
+        .flatten()
+        // The kernel takes no dead next hop.
+        .filter(|hop| !hop.flags.contains(RouteNextHopFlags::Dead))
+        .map(|hop| next_hop(&hop.attributes, Some(hop.interface_index), family))
+        .chain(multipath.is_none().then_some(own_next_hop));
+    let mut selected = next_hops.filter(|(gateway, ifindex)| {
         route
             .gateway
-            .is_none_or(|selected| gateway == Some(selected))
+            .is_none_or(|selected| *gateway == Ok(Some(selected)))
             && route
                 .ifindex
-                .is_none_or(|selected| ifindex == Some(selected))
+                .is_none_or(|selected| *ifindex == Some(selected))
     });
     let next_hop = match (selected.next(), selected.next()) {
         (None, _) => return None,
-        (Some((gateway, ifindex)), None) => Ok(Route {
+        (Some((gateway, ifindex)), None) => gateway.map(|gateway| Route {
             gateway,
             ifindex,
             ..entry
@@ -535,8 +562,11 @@ fn enqueue_route_changes(
             _ => continue,
         };
 
+        // TODO: a route through a gateway of another family is skipped, and
+        // one with several next hops (RTA_MULTIPATH), or with only a nexthop
+        // object under `nexthop_compat_mode` off, reports none.
         if in_main_table(&rt_msg)
-            && let Some(route) = route_from_message(&rt_msg)
+            && let Ok(route) = route_from_message(&rt_msg)
         {
             pending.push_back((change, route));
         }
@@ -596,7 +626,7 @@ mod tests {
     };
 
     use netlink_packet_core::{DefaultNla, DoneMessage, NLM_F_MULTIPART};
-    use netlink_packet_route::route::RouteNextHop;
+    use netlink_packet_route::route::{RouteNextHop, RouteVia};
 
     use super::*;
 
@@ -671,12 +701,14 @@ mod tests {
         rt_msg
     }
 
-    /// `get(query)` of a default route, from a fake kernel that answers the
-    /// dump with `replies`, each flagged multipart and with `flags`.
-    fn dump_default_route(
+    /// `get(query)` from a fake kernel that answers with `replies`, each
+    /// flagged multipart and with `flags`; a dump if `query` is the default
+    /// route.
+    fn get_from_fake_kernel(
         query: Route,
         replies: Vec<(u16, NetlinkPayload<RouteNetlinkMessage>)>,
     ) -> io::Result<Route> {
+        let dump = query.destination.is_unspecified() && query.prefix == 0;
         let (client, kernel) = UnixDatagram::pair().unwrap();
         client
             .set_read_timeout(Some(Duration::from_secs(5)))
@@ -685,7 +717,7 @@ mod tests {
             let mut buf = [0; RECV_BUF_LEN];
             let n = kernel.recv(&mut buf).unwrap();
             let request = parse_nlmsgs(&buf[..n]).unwrap().remove(0);
-            assert_eq!(request.header.flags & NLM_F_DUMP, NLM_F_DUMP);
+            assert_eq!(request.header.flags & NLM_F_DUMP == NLM_F_DUMP, dump);
             for (flags, payload) in replies {
                 let header = request.header;
                 let mut reply = message(header.sequence_number, header.port_number, payload);
@@ -906,6 +938,70 @@ mod tests {
         assert!(default_route_candidate(&one_dead, &any.ifindex(3)).is_none());
     }
 
+    fn through_ipv6_gateway(mut rt_msg: RouteMessage) -> RouteMessage {
+        rt_msg
+            .attributes
+            .retain(|attr| !matches!(attr, RouteAttribute::Gateway(_)));
+        rt_msg
+            .attributes
+            .push(RouteAttribute::Via(RouteVia::Inet6(Ipv6Addr::new(
+                0xfe80, 0, 0, 0, 0, 0, 0, 1,
+            ))));
+        rt_msg
+    }
+
+    #[test]
+    fn route_through_a_gateway_of_another_family_is_not_on_link() {
+        let rt_msg = through_ipv6_gateway(default_route(Ipv4Addr::new(192, 168, 1, 1), 2, None));
+
+        assert!(route_from_message(&rt_msg).is_err());
+        for query in [Route::default(), Route::default().ifindex(2)] {
+            assert!(matches!(
+                default_route_candidate(&rt_msg, &query),
+                Some((0, Err(_)))
+            ));
+        }
+        let mut pending = VecDeque::new();
+        enqueue_route_changes(vec![message(0, 0, new_route(rt_msg))], &mut pending).unwrap();
+        assert!(pending.is_empty());
+
+        let reply = through_ipv6_gateway(main_table_message(
+            &Route::new(IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1)), 32).ifindex(2),
+        ));
+        let error = get_from_fake_kernel(
+            Route::new(IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1)), 32),
+            vec![(0, new_route(reply))],
+        )
+        .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::Unsupported);
+    }
+
+    #[test]
+    fn multipath_next_hop_through_a_gateway_of_another_family_is_unsupported() {
+        let mut rt_msg = multipath_default_route(10);
+        for attr in &mut rt_msg.attributes {
+            if let RouteAttribute::MultiPath(hops) = attr {
+                hops[0].attributes = vec![RouteAttribute::Via(RouteVia::Inet6(Ipv6Addr::new(
+                    0xfe80, 0, 0, 0, 0, 0, 0, 1,
+                )))];
+            }
+        }
+
+        assert!(matches!(
+            default_route_candidate(&rt_msg, &Route::default().ifindex(2)),
+            Some((10, Err(_)))
+        ));
+        assert_eq!(
+            default_route_candidate(&rt_msg, &Route::default().ifindex(3)),
+            Some((
+                10,
+                Ok(Route::default()
+                    .gateway(IpAddr::V4(Ipv4Addr::new(192, 168, 2, 1)))
+                    .ifindex(3))
+            ))
+        );
+    }
+
     #[test]
     fn default_route_through_a_nexthop_object_is_unsupported() {
         let mut rt_msg = default_route(Ipv4Addr::new(192, 168, 1, 1), 2, Some(10));
@@ -929,7 +1025,7 @@ mod tests {
 
     #[test]
     fn default_route_dump_picks_the_lowest_metric() {
-        let route = dump_default_route(
+        let route = get_from_fake_kernel(
             Route::default(),
             vec![
                 (
@@ -961,7 +1057,7 @@ mod tests {
 
     #[test]
     fn interrupted_default_route_dump_is_an_error() {
-        let error = dump_default_route(
+        let error = get_from_fake_kernel(
             Route::default(),
             vec![
                 (
@@ -982,7 +1078,7 @@ mod tests {
 
     #[test]
     fn failed_default_route_dump_is_an_error() {
-        let error = dump_default_route(
+        let error = get_from_fake_kernel(
             Route::default(),
             vec![
                 (
@@ -1010,10 +1106,10 @@ mod tests {
             ]
         };
 
-        let error = dump_default_route(Route::default(), replies()).unwrap_err();
+        let error = get_from_fake_kernel(Route::default(), replies()).unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::Unsupported);
 
-        let route = dump_default_route(Route::default().ifindex(4), replies()).unwrap();
+        let route = get_from_fake_kernel(Route::default().ifindex(4), replies()).unwrap();
         assert_eq!(
             route.gateway,
             Some(IpAddr::V4(Ipv4Addr::new(192, 168, 9, 1)))
