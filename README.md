@@ -16,7 +16,13 @@ fn main() -> std::io::Result<()> {
 
     // The unspecified address with prefix 0 asks for the default route.
     let default = sock.get(&Route::default())?;
-    let route = Route::new("198.18.0.0".parse().unwrap(), 15).gateway(default.gateway.unwrap());
+    // Through the gateway of the default route, and out of its interface; a
+    // default route on a point-to-point link may have no gateway.
+    let route = Route {
+        destination: "198.18.0.0".parse().unwrap(),
+        prefix: 15,
+        ..default
+    };
 
     sock.add(&route)?;
     sock.delete(&route)
@@ -30,10 +36,17 @@ settings.
 
 ## Semantics
 
-- `get` returns the routing table entry the kernel routes the destination by,
-  not the destination as a host route. It honours `ifindex` on Linux and
-  Windows, and `scope_ifindex` on macOS.
-- On Linux, `add`, `delete` and `RouteMonitor` work on the main table only.
+- `get` tells how the kernel routes the destination: the gateway and interface
+  it picks. The destination and prefix it reports are the platform's own: the
+  matching table entry on Windows, that entry or a host route cloned from it on
+  macOS, and the destination as a host route on Linux. It honours `ifindex` on
+  Linux and Windows, and `scope_ifindex` on macOS.
+- `get` of the unspecified address with prefix 0 returns the default route. On
+  Linux that is the main-table one with the lowest metric; a multipath one is
+  an error, as a `Route` holds a single next hop.
+- On Linux, `add`, `delete` and `RouteMonitor` work on the main table only. The
+  monitor reports every route of it, blackholes included; a multipath route
+  without its gateways and interfaces.
 - On macOS, `Route::ifscope` installs an interface-scoped route
   (`RTF_IFSCOPE`), which only lookups bound to that interface match: the way to
   keep a per-interface default route next to a VPN's.
