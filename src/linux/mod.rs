@@ -12,13 +12,13 @@ use libc::{
 };
 use netlink_packet_core::{
     ErrorMessage, NLM_F_ACK, NLM_F_CREATE, NLM_F_DUMP, NLM_F_DUMP_INTR, NLM_F_EXCL, NLM_F_REQUEST,
-    NetlinkHeader, NetlinkMessage, NetlinkPayload,
+    NetlinkHeader, NetlinkMessage, NetlinkPayload, Nla,
 };
 use netlink_packet_route::{
     AddressFamily, RouteNetlinkMessage,
     route::{
-        RouteAddress, RouteAttribute, RouteFlags, RouteHeader, RouteMessage, RouteProtocol,
-        RouteScope, RouteType,
+        RouteAddress, RouteAttribute, RouteFlags, RouteHeader, RouteMessage, RouteNextHopFlags,
+        RouteProtocol, RouteScope, RouteType,
     },
 };
 
@@ -97,7 +97,8 @@ impl RouteSock {
     /// it is set: the gateway and interface it picks, for the destination as
     /// a host route. The unspecified address with prefix 0 asks for the
     /// main-table default route instead, through the gateway and interface of
-    /// `route` where they are set; one with several next hops is an error.
+    /// `route` where they are set; one that leaves through several live next
+    /// hops, or a nexthop object, is an error.
     pub fn get(&mut self, route: &Route) -> io::Result<Route> {
         route.validate()?;
 
@@ -128,7 +129,7 @@ impl RouteSock {
         dump.header.address_family = address_family(route.destination);
         let sequence = self.request(NLM_F_DUMP, RouteNetlinkMessage::GetRoute(dump))?;
 
-        let mut best: Option<(u32, Option<Route>)> = None;
+        let mut best: Option<(u32, Result<Route, &'static str>)> = None;
         let mut interrupted = false;
         self.replies(sequence, |message| {
             // The kernel flags the messages of a dump that a change to the
@@ -152,11 +153,10 @@ impl RouteSock {
                         io::ErrorKind::Interrupted,
                         "the routing table changed during the dump",
                     )),
-                    (None, Some((_, Some(route)))) => Ok(route),
-                    (None, Some((_, None))) => Err(io::Error::new(
-                        io::ErrorKind::Unsupported,
-                        "the default route has several next hops",
-                    )),
+                    (None, Some((_, Ok(route)))) => Ok(route),
+                    (None, Some((_, Err(reason)))) => {
+                        Err(io::Error::new(io::ErrorKind::Unsupported, reason))
+                    }
                     (None, None) => {
                         Err(io::Error::new(io::ErrorKind::NotFound, "no default route"))
                     }
@@ -326,7 +326,8 @@ fn change_message(route: &Route) -> RouteMessage {
 }
 
 // TODO: a multipath route keeps its gateways and interfaces in
-// RTA_MULTIPATH, so a monitor reports it without either.
+// RTA_MULTIPATH, and with `nexthop_compat_mode` off a route only names its
+// nexthop object: a monitor reports either without them.
 fn route_from_message(rt_msg: &RouteMessage) -> Option<Route> {
     let mut route = Route::new(
         unspecified(rt_msg.header.address_family),
@@ -361,11 +362,14 @@ fn in_main_table(rt_msg: &RouteMessage) -> bool {
     table == u32::from(RouteHeader::RT_TABLE_MAIN)
 }
 
-/// A live main-table unicast default route that applies to any packet and
-/// matches the selectors of `route`, with the metric the kernel ranks it by.
-/// The route is `None` when it has several next hops, which a `Route` cannot
-/// hold.
-fn default_route_candidate(rt_msg: &RouteMessage, route: &Route) -> Option<(u32, Option<Route>)> {
+/// A live main-table unicast default route that applies to any packet,
+/// with the metric the kernel ranks it by, if a live next hop of it matches
+/// the selectors of `route`. It is an error when it would not leave through
+/// one known next hop, which is all a `Route` can hold.
+fn default_route_candidate(
+    rt_msg: &RouteMessage,
+    route: &Route,
+) -> Option<(u32, Result<Route, &'static str>)> {
     let header = &rt_msg.header;
     // A route for some sources or some TOS only applies to some packets.
     if header.destination_prefix_length != 0
@@ -378,36 +382,6 @@ fn default_route_candidate(rt_msg: &RouteMessage, route: &Route) -> Option<(u32,
         return None;
     }
 
-    let candidate = route_from_message(rt_msg)?;
-    let selects = |gateway: Option<IpAddr>, ifindex: Option<u32>| {
-        route
-            .gateway
-            .is_none_or(|selected| gateway == Some(selected))
-            && route
-                .ifindex
-                .is_none_or(|selected| ifindex == Some(selected))
-    };
-    let multipath = rt_msg.attributes.iter().find_map(|attr| match attr {
-        RouteAttribute::MultiPath(hops) => Some(hops),
-        _ => None,
-    });
-    let (selected, candidate) = match multipath {
-        None => (
-            selects(candidate.gateway, candidate.ifindex),
-            Some(candidate),
-        ),
-        // Selected if one of its next hops is.
-        Some(hops) => {
-            let selected = hops.iter().any(|hop| {
-                let gateway = hop.attributes.iter().find_map(|attr| match attr {
-                    RouteAttribute::Gateway(addr) => ip_addr(addr),
-                    _ => None,
-                });
-                selects(gateway, Some(hop.interface_index))
-            });
-            (selected, None)
-        }
-    };
     let metric = rt_msg
         .attributes
         .iter()
@@ -416,8 +390,64 @@ fn default_route_candidate(rt_msg: &RouteMessage, route: &Route) -> Option<(u32,
             _ => None,
         })
         .unwrap_or(0);
+    let entry = route_from_message(rt_msg)?;
+    let multipath = rt_msg.attributes.iter().find_map(|attr| match attr {
+        RouteAttribute::MultiPath(hops) => Some(hops),
+        _ => None,
+    });
+    let next_hops: Vec<(Option<IpAddr>, Option<u32>)> = match multipath {
+        Some(hops) => hops
+            .iter()
+            // The kernel takes no dead next hop.
+            .filter(|hop| !hop.flags.contains(RouteNextHopFlags::Dead))
+            .map(|hop| {
+                let gateway = hop.attributes.iter().find_map(|attr| match attr {
+                    RouteAttribute::Gateway(addr) => ip_addr(addr),
+                    _ => None,
+                });
+                (gateway, Some(hop.interface_index))
+            })
+            .collect(),
+        // With `nexthop_compat_mode` off, a route only names its nexthop
+        // object, so neither its next hops nor whether they match are known.
+        None if entry.gateway.is_none()
+            && entry.ifindex.is_none()
+            && uses_nexthop_object(rt_msg) =>
+        {
+            return Some((metric, Err("the default route uses a nexthop object")));
+        }
+        None => vec![(entry.gateway, entry.ifindex)],
+    };
 
-    selected.then_some((metric, candidate))
+    let mut selected = next_hops.into_iter().filter(|&(gateway, ifindex)| {
+        route
+            .gateway
+            .is_none_or(|selected| gateway == Some(selected))
+            && route
+                .ifindex
+                .is_none_or(|selected| ifindex == Some(selected))
+    });
+    let next_hop = match (selected.next(), selected.next()) {
+        (None, _) => return None,
+        (Some((gateway, ifindex)), None) => Ok(Route {
+            gateway,
+            ifindex,
+            ..entry
+        }),
+        (Some(_), Some(_)) => Err("the default route has several next hops"),
+    };
+
+    Some((metric, next_hop))
+}
+
+fn uses_nexthop_object(rt_msg: &RouteMessage) -> bool {
+    // RTA_NH_ID, which netlink-packet-route leaves unparsed.
+    const RTA_NH_ID: u16 = 30;
+
+    rt_msg
+        .attributes
+        .iter()
+        .any(|attr| matches!(attr, RouteAttribute::Other(nla) if nla.kind() == RTA_NH_ID))
 }
 
 fn parse_nlmsgs(bytes: &[u8]) -> io::Result<Vec<NetlinkMessage<RouteNetlinkMessage>>> {
@@ -565,7 +595,7 @@ mod tests {
         time::Duration,
     };
 
-    use netlink_packet_core::{DoneMessage, NLM_F_MULTIPART};
+    use netlink_packet_core::{DefaultNla, DoneMessage, NLM_F_MULTIPART};
     use netlink_packet_route::route::RouteNextHop;
 
     use super::*;
@@ -793,7 +823,7 @@ mod tests {
         let gateway = Ipv4Addr::new(192, 168, 1, 1);
         let any = Route::default();
 
-        let (metric, Some(route)) =
+        let (metric, Ok(route)) =
             default_route_candidate(&default_route(gateway, 2, Some(100)), &any).unwrap()
         else {
             panic!("a single-path route has a Route");
@@ -848,19 +878,53 @@ mod tests {
     }
 
     #[test]
-    fn multipath_default_route_has_no_single_route() {
+    fn multipath_default_route_is_a_route_through_its_one_selected_live_next_hop() {
         let any = Route::default();
-        let gateway = IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1));
+        let first = IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1));
+        let through_first = any.gateway(first).ifindex(2);
 
-        assert_eq!(
+        assert!(matches!(
             default_route_candidate(&multipath_default_route(10), &any),
-            Some((10, None))
-        );
+            Some((10, Err(_)))
+        ));
         assert_eq!(
-            default_route_candidate(&multipath_default_route(10), &any.gateway(gateway)),
-            Some((10, None))
+            default_route_candidate(&multipath_default_route(10), &any.gateway(first)),
+            Some((10, Ok(through_first)))
         );
         assert!(default_route_candidate(&multipath_default_route(10), &any.ifindex(4)).is_none());
+
+        let mut one_dead = multipath_default_route(10);
+        for attr in &mut one_dead.attributes {
+            if let RouteAttribute::MultiPath(hops) = attr {
+                hops[1].flags = RouteNextHopFlags::Dead | RouteNextHopFlags::Linkdown;
+            }
+        }
+        assert_eq!(
+            default_route_candidate(&one_dead, &any),
+            Some((10, Ok(through_first)))
+        );
+        assert!(default_route_candidate(&one_dead, &any.ifindex(3)).is_none());
+    }
+
+    #[test]
+    fn default_route_through_a_nexthop_object_is_unsupported() {
+        let mut rt_msg = default_route(Ipv4Addr::new(192, 168, 1, 1), 2, Some(10));
+        rt_msg
+            .attributes
+            .retain(|attr| !matches!(attr, RouteAttribute::Gateway(_) | RouteAttribute::Oif(_)));
+        rt_msg
+            .attributes
+            .push(RouteAttribute::Other(DefaultNla::new(
+                30,
+                103u32.to_ne_bytes().to_vec(),
+            )));
+
+        for query in [Route::default(), Route::default().ifindex(2)] {
+            assert!(matches!(
+                default_route_candidate(&rt_msg, &query),
+                Some((10, Err(_)))
+            ));
+        }
     }
 
     #[test]

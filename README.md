@@ -42,8 +42,10 @@ settings.
   macOS, and the destination as a host route on Linux. It honours `ifindex` on
   Linux and Windows, and `scope_ifindex` on macOS.
 - `get` of the unspecified address with prefix 0 returns the default route. On
-  Linux that is the main-table one with the lowest metric; a multipath one is
-  an error, as a `Route` holds a single next hop.
+  Linux that is the main-table one with the lowest metric, through its live
+  next hop that `gateway` and `ifindex` select; one with several such next
+  hops, or with a nexthop object the kernel does not expand, is an error, as a
+  `Route` holds a single next hop.
 - On Linux, `add`, `delete` and `RouteMonitor` work on the main table only. The
   monitor reports every route of it, blackholes included; a multipath route
   without its gateways and interfaces.
