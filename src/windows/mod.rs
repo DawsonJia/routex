@@ -22,8 +22,10 @@ use windows_sys::Win32::{
     },
 };
 
-use crate::{Route, RouteAction, RouteChange};
+use crate::Route;
 
+/// Changes and queries the routing table through the IP Helper API.
+// TODO: a `RouteMonitor` backed by NotifyRouteChange2.
 pub struct RouteSock;
 
 impl RouteSock {
@@ -31,14 +33,9 @@ impl RouteSock {
         Ok(Self)
     }
 
-    pub fn new_buf() -> [u8; 0] {
-        // TODO: replace this placeholder when monitor is backed by NotifyRouteChange2.
-        []
-    }
-}
-
-impl RouteAction for RouteSock {
-    fn add(&mut self, route: &Route) -> io::Result<()> {
+    /// Adds `route`. Without an interface, it goes out of the one of the best
+    /// route to its gateway, or else to its destination.
+    pub fn add(&mut self, route: &Route) -> io::Result<()> {
         route.validate()?;
 
         let mut row = route_row(route);
@@ -46,14 +43,19 @@ impl RouteAction for RouteSock {
         win32_result(unsafe { CreateIpForwardEntry2(&row) })
     }
 
-    fn delete(&mut self, route: &Route) -> io::Result<()> {
+    /// Deletes the one route that `route` selects by destination, and by
+    /// gateway and interface where they are set.
+    pub fn delete(&mut self, route: &Route) -> io::Result<()> {
         route.validate()?;
 
         let row = find_unique_route(route)?;
         win32_result(unsafe { DeleteIpForwardEntry2(&row) })
     }
 
-    fn get(&mut self, route: &Route) -> io::Result<Route> {
+    /// The best route to `route.destination`, out of `route.ifindex` if it is
+    /// set. The unspecified address with prefix 0 asks for the default route,
+    /// through the gateway and interface of `route` where they are set.
+    pub fn get(&mut self, route: &Route) -> io::Result<Route> {
         route.validate()?;
 
         // GetBestRoute2 treats an unspecified destination as a lookup target, not as "show default route".
@@ -63,19 +65,13 @@ impl RouteAction for RouteSock {
             best_route(route.destination, route.ifindex.unwrap_or(0))?
         };
 
-        Ok(route_from_row(&row))
-    }
-
-    fn monitor(&mut self, _buf: &mut [u8]) -> io::Result<(RouteChange, Route)> {
-        // TODO: implement this with NotifyRouteChange2 and an internal event queue.
-        Err(io::Error::new(
-            io::ErrorKind::Unsupported,
-            "Windows route monitoring is not implemented",
-        ))
+        route_from_row(&row)
     }
 }
 
-pub(crate) fn if_friendly_name_to_index(name: &str) -> Option<u32> {
+/// The index of the adapter whose friendly name, as shown in the network
+/// settings, is `name`, ignoring case.
+pub fn if_friendly_name_to_index(name: &str) -> Option<u32> {
     let table = AdapterAddressTable::new().ok()?;
     let target = name.to_lowercase();
 
@@ -159,10 +155,10 @@ fn best_matching_route(route: &Route) -> io::Result<MIB_IPFORWARD_ROW2> {
 
 fn row_matches(row: &MIB_IPFORWARD_ROW2, route: &Route) -> bool {
     row.DestinationPrefix.PrefixLength == route.prefix
-        && sockaddr_ip(row.DestinationPrefix.Prefix) == route.destination
+        && sockaddr_ip(row.DestinationPrefix.Prefix) == Some(route.destination)
         && route
             .gateway
-            .is_none_or(|gateway| sockaddr_ip(row.NextHop) == gateway)
+            .is_none_or(|gateway| sockaddr_ip(row.NextHop) == Some(gateway))
         && route
             .ifindex
             .is_none_or(|ifindex| row.InterfaceIndex == ifindex)
@@ -191,7 +187,7 @@ fn best_route(destination: IpAddr, interface_index: u32) -> io::Result<MIB_IPFOR
 fn interface_metric(route: &MIB_IPFORWARD_ROW2) -> io::Result<Option<u32>> {
     let mut interface = MIB_IPINTERFACE_ROW::default();
     unsafe { InitializeIpInterfaceEntry(&mut interface) };
-    interface.Family = address_family(sockaddr_ip(route.DestinationPrefix.Prefix));
+    interface.Family = unsafe { route.DestinationPrefix.Prefix.si_family };
     interface.InterfaceLuid = route.InterfaceLuid;
     interface.InterfaceIndex = route.InterfaceIndex;
     win32_result(unsafe { GetIpInterfaceEntry(&mut interface) })?;
@@ -206,12 +202,12 @@ fn usable_interface_metric(interface: &MIB_IPINTERFACE_ROW) -> Option<u32> {
 fn route_rank(
     route: &MIB_IPFORWARD_ROW2,
     interface_metric: u32,
-) -> (u64, u32, u32, (u8, [u8; 16])) {
+) -> (u64, u32, u32, Option<(u8, [u8; 16])>) {
     (
         u64::from(route.Metric) + u64::from(interface_metric),
         route.Metric,
         route.InterfaceIndex,
-        ip_sort_key(sockaddr_ip(route.NextHop)),
+        sockaddr_ip(route.NextHop).map(ip_sort_key),
     )
 }
 
@@ -235,18 +231,15 @@ fn resolve_interface_index(route: &Route) -> io::Result<u32> {
     Ok(best_route(target, 0)?.InterfaceIndex)
 }
 
-fn route_from_row(row: &MIB_IPFORWARD_ROW2) -> Route {
-    let mut route = Route::new(
-        sockaddr_ip(row.DestinationPrefix.Prefix),
-        row.DestinationPrefix.PrefixLength,
-    );
-    let gateway = sockaddr_ip(row.NextHop);
-    if !gateway.is_unspecified() {
-        route.gateway = Some(gateway);
-    }
+fn route_from_row(row: &MIB_IPFORWARD_ROW2) -> io::Result<Route> {
+    let destination = sockaddr_ip(row.DestinationPrefix.Prefix)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "non-IP route destination"))?;
+    let mut route = Route::new(destination, row.DestinationPrefix.PrefixLength);
+    // An on-link route has an all-zero next hop.
+    route.gateway = sockaddr_ip(row.NextHop).filter(|gateway| !gateway.is_unspecified());
     route.ifindex = Some(row.InterfaceIndex);
 
-    route
+    Ok(route)
 }
 
 fn sockaddr(addr: IpAddr) -> SOCKADDR_INET {
@@ -279,12 +272,15 @@ fn sockaddr(addr: IpAddr) -> SOCKADDR_INET {
     }
 }
 
-fn sockaddr_ip(addr: SOCKADDR_INET) -> IpAddr {
+fn sockaddr_ip(addr: SOCKADDR_INET) -> Option<IpAddr> {
+    // Every variant starts with the family, which tells the one to read.
     unsafe {
         match addr.si_family {
-            AF_INET => IpAddr::V4(Ipv4Addr::from(addr.Ipv4.sin_addr.S_un.S_addr.to_ne_bytes())),
-            AF_INET6 => IpAddr::V6(Ipv6Addr::from(addr.Ipv6.sin6_addr.u.Byte)),
-            family => unreachable!("unsupported SOCKADDR_INET family {family}"),
+            AF_INET => Some(IpAddr::V4(Ipv4Addr::from(
+                addr.Ipv4.sin_addr.S_un.S_addr.to_ne_bytes(),
+            ))),
+            AF_INET6 => Some(IpAddr::V6(Ipv6Addr::from(addr.Ipv6.sin6_addr.u.Byte))),
+            _ => None,
         }
     }
 }
@@ -303,6 +299,8 @@ fn address_family(addr: IpAddr) -> ADDRESS_FAMILY {
     }
 }
 
+// TODO: keep the raw code in AlreadyExists and NotFound as well, so that
+// `raw_os_error` works as it does on Linux and macOS.
 fn win32_result(code: u32) -> io::Result<()> {
     match code {
         ERROR_SUCCESS => Ok(()),

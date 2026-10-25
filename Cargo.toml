@@ -1,18 +1,20 @@
 [package]
 name = "routex"
-version = "0.2.1"
+version = "0.3.0"
 edition = "2024"
+rust-version = "1.88"
 
 license = "MIT"
 authors = ["dawson a957360688@gmail.com"]
 repository = "https://github.com/Dawson-Jones/routex"
-description = "cross platform route implement"
+description = "Add, delete, look up and monitor IP routes on Linux, macOS and Windows"
+# Apple's route(8) sources, kept as a reference under their own license.
+exclude = ["reference/"]
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
 libc = "0.2"
-ipnetwork = "0.21"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 netlink-packet-route = "0.30"

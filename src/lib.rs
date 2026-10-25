@@ -1,3 +1,5 @@
+#![doc = include_str!("../README.md")]
+
 use std::{ffi::CString, io, net::IpAddr};
 
 // Keep raw syscalls inside this crate. Exporting a macro that supplies its own
@@ -16,6 +18,8 @@ macro_rules! syscall {
     }};
 }
 
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+mod fd;
 #[cfg(target_os = "linux")]
 mod linux;
 #[cfg(target_os = "macos")]
@@ -24,38 +28,36 @@ mod macos;
 mod windows;
 
 #[cfg(target_os = "linux")]
-pub use linux::RouteSock;
+pub use linux::{RouteMonitor, RouteSock};
 #[cfg(target_os = "macos")]
-pub use macos::RouteSock;
+pub use macos::{RouteMonitor, RouteSock};
 #[cfg(target_os = "windows")]
-pub use windows::RouteSock;
+pub use windows::{RouteSock, if_friendly_name_to_index};
 
-#[derive(Debug, Clone)]
+/// A route: traffic to `destination/prefix` goes through `gateway`, or
+/// straight out of interface `ifindex`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Route {
     pub destination: IpAddr,
     pub prefix: u8,
+    /// The next hop, of the family of `destination`.
     pub gateway: Option<IpAddr>,
+    /// The outgoing interface. Without a gateway, the destination is on its
+    /// link.
     pub ifindex: Option<u32>,
     /// macOS interface-scoped routing (`RTF_IFSCOPE`). When set, the route
     /// is only matched by lookups whose `IP_BOUND_IF` scope equals this
     /// ifindex. Used to install a per-interface copy of the default route so
     /// that physical-NIC-bound sockets can still reach the internet after a
-    /// VPN's `0/1` + `128/1` routes have taken the unscoped default. Linux
-    /// and Windows backends ignore this field.
+    /// VPN's `0/1` + `128/1` routes have taken the unscoped default.
+    #[cfg(target_os = "macos")]
     pub scope_ifindex: Option<u32>,
 }
 
+/// The IPv4 default route, `0.0.0.0/0`.
 impl Default for Route {
     fn default() -> Self {
-        use std::net::Ipv4Addr;
-
-        Route {
-            destination: IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0)),
-            prefix: 0,
-            gateway: None,
-            ifindex: None,
-            scope_ifindex: None,
-        }
+        Route::new(IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED), 0)
     }
 }
 
@@ -66,41 +68,21 @@ impl Route {
             prefix,
             gateway: None,
             ifindex: None,
+            #[cfg(target_os = "macos")]
             scope_ifindex: None,
         }
     }
 
-    #[cfg(target_os = "macos")]
-    pub(crate) fn mask(&self) -> IpAddr {
-        use std::net::{Ipv4Addr, Ipv6Addr};
-
+    /// The prefix length of a host route to `destination`.
+    pub(crate) fn max_prefix(&self) -> u8 {
         match self.destination {
-            IpAddr::V4(_) => IpAddr::V4(Ipv4Addr::from(
-                u32::MAX.checked_shl(32 - self.prefix as u32).unwrap_or(0),
-            )),
-            IpAddr::V6(_) => IpAddr::V6(Ipv6Addr::from(
-                u128::MAX.checked_shl(128 - self.prefix as u32).unwrap_or(0),
-            )),
-        }
-    }
-
-    #[cfg(target_os = "macos")]
-    pub(crate) fn cidr(&mut self, netmask: IpAddr) {
-        use std::net::{Ipv4Addr, Ipv6Addr};
-
-        self.prefix = match netmask {
-            IpAddr::V4(netmask) => <Ipv4Addr as Into<u32>>::into(netmask).leading_ones() as u8,
-            IpAddr::V6(netmask) => <Ipv6Addr as Into<u128>>::into(netmask).leading_ones() as u8,
+            IpAddr::V4(_) => 32,
+            IpAddr::V6(_) => 128,
         }
     }
 
     pub(crate) fn validate(&self) -> io::Result<()> {
-        let max_prefix = match self.destination {
-            IpAddr::V4(_) => 32,
-            IpAddr::V6(_) => 128,
-        };
-
-        if self.prefix > max_prefix {
+        if self.prefix > self.max_prefix() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 format!("invalid prefix {} for {}", self.prefix, self.destination),
@@ -122,12 +104,6 @@ impl Route {
         Ok(())
     }
 
-    #[cfg(target_os = "linux")]
-    pub fn via(mut self, gateway: IpAddr) -> Route {
-        self.gateway = Some(gateway);
-        self
-    }
-
     pub fn gateway(mut self, gateway: IpAddr) -> Route {
         self.gateway = Some(gateway);
         self
@@ -138,53 +114,25 @@ impl Route {
         self
     }
 
-    /// macOS-only: scope this route to a specific interface (`RTF_IFSCOPE`).
-    /// No-op on Linux/Windows backends.
+    /// Scope this route to a specific interface (`RTF_IFSCOPE`).
     #[cfg(target_os = "macos")]
     pub fn ifscope(mut self, ifindex: u32) -> Route {
         self.scope_ifindex = Some(ifindex);
         self
     }
-
-    #[cfg(any(target_os = "macos", target_os = "windows"))]
-    pub fn interface(mut self, interface: &str) -> Route {
-        self.ifindex = if_nametoindex(interface);
-        self
-    }
-
-    #[cfg(target_os = "linux")]
-    pub fn dev(mut self, interface: &str) -> Route {
-        self.ifindex = if_nametoindex(interface);
-        self
-    }
 }
 
-#[derive(Debug)]
+/// A change to the routing table, as reported by [`RouteMonitor`].
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum RouteChange {
-    ADD,
-    DELETE,
-    CHANGE,
-    OTHER(u8),
+    Add,
+    Delete,
+    /// An existing route got a new gateway, interface or metrics (macOS).
+    Change,
 }
 
-impl From<u8> for RouteChange {
-    fn from(value: u8) -> Self {
-        match value {
-            1 => RouteChange::ADD,
-            2 => RouteChange::DELETE,
-            3 => RouteChange::CHANGE,
-            _ => RouteChange::OTHER(value),
-        }
-    }
-}
-
-pub trait RouteAction {
-    fn add(&mut self, route: &Route) -> io::Result<()>;
-    fn delete(&mut self, route: &Route) -> io::Result<()>;
-    fn get(&mut self, route: &Route) -> io::Result<Route>;
-    fn monitor(&mut self, buf: &mut [u8]) -> io::Result<(RouteChange, Route)>;
-}
-
+/// The index of the interface named `name`.
 pub fn if_nametoindex(name: &str) -> Option<u32> {
     let name = CString::new(name).ok()?;
 
@@ -197,11 +145,6 @@ pub fn if_nametoindex(name: &str) -> Option<u32> {
     };
 
     (ifindex != 0).then_some(ifindex)
-}
-
-#[cfg(target_os = "windows")]
-pub fn if_friendly_name_to_index(name: &str) -> Option<u32> {
-    windows::if_friendly_name_to_index(name)
 }
 
 #[cfg(test)]
