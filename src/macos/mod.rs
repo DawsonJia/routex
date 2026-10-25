@@ -2,22 +2,28 @@ mod rtmsg;
 
 use std::{
     io,
+    net::{IpAddr, Ipv4Addr, Ipv6Addr},
     os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd, RawFd},
     sync::atomic::{AtomicI32, Ordering},
     time::{Duration, Instant},
 };
 
-use crate::{Route, RouteChange, fd, macos::rtmsg::m_rtmsg};
 use libc::{
-    AF_INET, AF_INET6, AF_ROUTE, AF_UNSPEC, F_SETFD, FD_CLOEXEC, RTA_DST, RTA_GATEWAY, RTA_IFP,
-    RTA_NETMASK, RTAX_MAX, RTF_GATEWAY, RTF_HOST, RTF_STATIC, RTF_UP, RTM_ADD, RTM_CHANGE,
-    RTM_DELETE, RTM_GET, RTM_VERSION, SHUT_RD, SOCK_RAW, rt_msghdr,
+    AF_INET, AF_INET6, AF_LINK, AF_ROUTE, AF_UNSPEC, F_SETFD, FD_CLOEXEC, RTA_DST, RTA_GATEWAY,
+    RTA_IFP, RTA_NETMASK, RTF_GATEWAY, RTF_HOST, RTF_STATIC, RTF_UP, RTM_ADD, RTM_CHANGE,
+    RTM_DELETE, RTM_GET, SHUT_RD, SOCK_RAW,
 };
+
+use crate::{Route, RouteChange, fd};
+use rtmsg::{MESSAGE_CAPACITY, Message, Writer, message_type};
 
 /// `RTF_IFSCOPE` is the XNU flag that ties a route to a specific interface
 /// for use by `IP_BOUND_IF` scoped lookups. Not exposed by `libc`'s macOS
 /// bindings, so define it locally from the XNU value (`net/route.h`).
 const RTF_IFSCOPE: i32 = 0x1000000;
+
+/// A `get` reply is told apart by the pid and sequence of its request, so
+/// sequences are unique across the sockets of the process.
 static ROUTE_SEQUENCE: AtomicI32 = AtomicI32::new(0);
 
 /// XNU drops a routing message, the reply to a request included, for a
@@ -58,65 +64,37 @@ impl RouteSock {
     pub fn add(&mut self, route: &Route) -> io::Result<()> {
         route.validate()?;
 
-        let mut rtmsg = write_route_addrs(route, RouteRequestKind::Add);
-        let seq = next_route_sequence();
-        rtmsg.hdr.rtm_type = RTM_ADD as u8;
-        rtmsg.hdr.rtm_flags = route_flags(route, route.gateway.is_some());
-        apply_ifscope(&mut rtmsg.hdr, route);
-        rtmsg.hdr.rtm_seq = seq;
-        rtmsg.hdr.rtm_pid = unsafe { libc::getpid() };
-        rtmsg.hdr.rtm_msglen = rtmsg.len() as u16;
-
-        fd::send(self.fd.as_fd(), route_msg_bytes(&rtmsg))
+        fd::send(self.fd.as_fd(), &request(route, RTM_ADD, next_sequence()))
     }
 
     pub fn delete(&mut self, route: &Route) -> io::Result<()> {
         route.validate()?;
 
-        let mut rtmsg = write_route_addrs(route, RouteRequestKind::Delete);
-        let seq = next_route_sequence();
-        rtmsg.hdr.rtm_type = RTM_DELETE as u8;
-        rtmsg.hdr.rtm_flags = route_flags(route, false);
-        apply_ifscope(&mut rtmsg.hdr, route);
-        rtmsg.hdr.rtm_seq = seq;
-        rtmsg.hdr.rtm_pid = unsafe { libc::getpid() };
-        rtmsg.hdr.rtm_msglen = rtmsg.len() as u16;
-
-        fd::send(self.fd.as_fd(), route_msg_bytes(&rtmsg))
+        fd::send(
+            self.fd.as_fd(),
+            &request(route, RTM_DELETE, next_sequence()),
+        )
     }
 
     pub fn get(&mut self, route: &Route) -> io::Result<Route> {
         route.validate()?;
-
-        let mut rtmsg = write_route_addrs(route, RouteRequestKind::Query);
-        let seq = next_route_sequence();
-        rtmsg.hdr.rtm_type = RTM_GET as u8;
-        rtmsg.hdr.rtm_flags = route_flags(route, true);
-        apply_ifscope(&mut rtmsg.hdr, route);
-        rtmsg.hdr.rtm_seq = seq;
-        rtmsg.hdr.rtm_pid = unsafe { libc::getpid() };
-        rtmsg.hdr.rtm_msglen = rtmsg.len() as u16;
 
         // Every routing socket receives every routing message on the host, so
         // a long-lived one fills up between two requests and the kernel drops
         // the reply. A fresh socket is empty, and loopback, on by default,
         // delivers the reply to it.
         let socket = open()?;
-        fd::send(socket.as_fd(), route_msg_bytes(&rtmsg))?;
+        let seq = next_sequence();
+        fd::send(socket.as_fd(), &request(route, RTM_GET, seq))?;
 
-        let mut response = read_request_response(socket.as_fd(), seq, RTM_GET as u8)?;
-        if response.hdr.rtm_errno != 0 {
-            return Err(code2error(response.hdr.rtm_errno));
-        }
-
-        read_route(&mut response)
+        read_reply(socket.as_fd(), seq)
     }
 }
 
 /// A routing socket that reports the changes to the routing table.
 pub struct RouteMonitor {
     fd: OwnedFd,
-    buf: [u8; std::mem::size_of::<m_rtmsg>()],
+    buf: [u8; MESSAGE_CAPACITY],
 }
 
 impl AsFd for RouteMonitor {
@@ -135,7 +113,7 @@ impl RouteMonitor {
     pub fn new() -> io::Result<Self> {
         Ok(Self {
             fd: open()?,
-            buf: m_rtmsg::new_buf(),
+            buf: [0; MESSAGE_CAPACITY],
         })
     }
 
@@ -143,23 +121,21 @@ impl RouteMonitor {
     pub fn recv(&mut self) -> io::Result<(RouteChange, Route)> {
         loop {
             let n = fd::recv(self.fd.as_fd(), &mut self.buf)?;
-            let prefix = message_prefix(&self.buf[..n])?;
-            let change = match i32::from(prefix.message_type) {
-                RTM_ADD => RouteChange::Add,
-                RTM_DELETE => RouteChange::Delete,
-                RTM_CHANGE => RouteChange::Change,
+            let change = match message_type(&self.buf[..n]).map(i32::from) {
+                Some(RTM_ADD) => RouteChange::Add,
+                Some(RTM_DELETE) => RouteChange::Delete,
+                Some(RTM_CHANGE) => RouteChange::Change,
                 _ => continue,
             };
 
-            let mut rtmsg = m_rtmsg::parse(&self.buf[..n])?;
-            validate_header(&rtmsg.hdr, None)?;
+            let message = Message::parse(&self.buf[..n])?;
             // XNU broadcasts a failed request too, with its errno: some
             // process's error, and no change to the table.
-            if rtmsg.hdr.rtm_errno != 0 {
+            if message.hdr.rtm_errno != 0 {
                 continue;
             }
 
-            return Ok((change, read_route(&mut rtmsg)?));
+            return Ok((change, read_route(&message)?));
         }
     }
 }
@@ -173,32 +149,77 @@ fn open() -> io::Result<OwnedFd> {
     Ok(fd)
 }
 
-fn read_request_response(fd: BorrowedFd<'_>, seq: i32, expected_type: u8) -> io::Result<m_rtmsg> {
-    let pid = unsafe { libc::getpid() };
+fn next_sequence() -> i32 {
+    ROUTE_SEQUENCE
+        .fetch_add(1, Ordering::Relaxed)
+        .wrapping_add(1)
+}
+
+/// The `rtm_type` request for `route`, encoded as `route` does.
+fn request(route: &Route, rtm_type: i32, seq: i32) -> Vec<u8> {
+    let mut message = Writer::new();
+    message.inet(RTA_DST, route.destination);
+    if rtm_type == RTM_ADD {
+        match (route.gateway, route.ifindex) {
+            (Some(gateway), _) => message.inet(RTA_GATEWAY, gateway),
+            // `route add ... -interface ifname` is encoded as a link-layer
+            // gateway. The route CLI does not also send RTA_IFP for this path.
+            (None, Some(ifindex)) => message.link(RTA_GATEWAY, ifindex),
+            (None, None) => {}
+        }
+    }
+    if rtm_type != RTM_GET {
+        message.netmask(netmask(route));
+    }
+    // A lookup asks the kernel to fill in IFP, so the slot must be reserved
+    // even when the caller does not yet know the ifindex. An add through a
+    // gateway names its interface the same way (`route add ... -ifp`).
+    match (rtm_type, route.gateway, route.ifindex) {
+        (RTM_GET, _, ifindex) => message.link(RTA_IFP, ifindex.unwrap_or(0)),
+        (RTM_ADD, Some(_), Some(ifindex)) => message.link(RTA_IFP, ifindex),
+        _ => {}
+    }
+
+    let mut flags = RTF_STATIC | RTF_UP;
+    if route.prefix == route.max_prefix() {
+        flags |= RTF_HOST;
+    }
+    if rtm_type == RTM_GET || rtm_type == RTM_ADD && route.gateway.is_some() {
+        flags |= RTF_GATEWAY;
+    }
+    // XNU encodes interface-scope in two coupled fields: the flag and the
+    // ifindex in `rtm_index`. Without either, it silently ignores the scope.
+    let mut index = 0;
+    if let Some(scope) = route.scope_ifindex {
+        flags |= RTF_IFSCOPE;
+        index = scope as u16;
+    }
+
+    message.finish(rtm_type, flags, index, seq)
+}
+
+fn read_reply(fd: BorrowedFd<'_>, seq: i32) -> io::Result<Route> {
+    let pid = std::process::id() as i32;
     let deadline = Instant::now() + REPLY_TIMEOUT;
-    let mut buf = m_rtmsg::new_buf();
+    let mut buf = [0; MESSAGE_CAPACITY];
     loop {
         wait_readable(fd, deadline)?;
         let n = fd::recv(fd, &mut buf)?;
-        // TODO: a foreign message that fails `message_prefix` or `parse`
-        // fails this request; only the reply needs strict parsing.
-        let prefix = message_prefix(&buf[..n])?;
-        if !matches!(
-            prefix.message_type,
-            kind if kind == RTM_ADD as u8
-                || kind == RTM_DELETE as u8
-                || kind == RTM_CHANGE as u8
-                || kind == RTM_GET as u8
-        ) {
+        // The host's other routing traffic arrives too; only replies need
+        // parsing.
+        if message_type(&buf[..n]) != Some(RTM_GET as u8) {
             continue;
         }
 
-        let rtmsg = m_rtmsg::parse(&buf[..n])?;
-        if rtmsg.hdr.rtm_pid != pid || rtmsg.hdr.rtm_seq != seq {
+        let reply = Message::parse(&buf[..n])?;
+        if reply.hdr.rtm_pid != pid || reply.hdr.rtm_seq != seq {
             continue;
         }
-        validate_header(&rtmsg.hdr, Some(expected_type))?;
-        return Ok(rtmsg);
+        if reply.hdr.rtm_errno != 0 {
+            return Err(io::Error::from_raw_os_error(reply.hdr.rtm_errno));
+        }
+
+        return read_route(&reply);
     }
 }
 
@@ -228,236 +249,84 @@ fn wait_readable(fd: BorrowedFd<'_>, deadline: Instant) -> io::Result<()> {
     }
 }
 
-fn next_route_sequence() -> i32 {
-    // TODO: `fetch_update` is deprecated in favor of `try_update` on current
-    // toolchains.
-    let previous = ROUTE_SEQUENCE
-        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |sequence| {
-            Some(if sequence == i32::MAX {
-                1
-            } else {
-                sequence + 1
-            })
-        })
-        .expect("sequence update closure always returns Some");
-
-    if previous == i32::MAX {
-        1
-    } else {
-        previous + 1
-    }
-}
-
-enum RouteRequestKind {
-    Add,
-    Delete,
-    Query,
-}
-
-fn write_route_addrs(route: &Route, kind: RouteRequestKind) -> m_rtmsg {
-    let mut rtmsg = m_rtmsg::default();
-    rtmsg.hdr.rtm_addrs = RTA_DST;
-
-    if matches!(kind, RouteRequestKind::Add | RouteRequestKind::Delete) {
-        rtmsg.hdr.rtm_addrs |= RTA_NETMASK;
-    }
-    if matches!(kind, RouteRequestKind::Add) && route.gateway.is_some() {
-        rtmsg.hdr.rtm_addrs |= RTA_GATEWAY;
-    }
-    if matches!(kind, RouteRequestKind::Add) && route.gateway.is_none() && route.ifindex.is_some() {
-        // `route add ... -interface ifname` is encoded as a link-layer gateway.
-        // The route CLI does not also send RTA_IFP for this path.
-        rtmsg.hdr.rtm_addrs |= RTA_GATEWAY;
-    }
-    // Query asks the kernel to fill in IFP, so the slot must be reserved
-    // even when the caller does not yet know the ifindex. An add through a
-    // gateway names its interface the same way (`route add ... -ifp`).
-    if matches!(kind, RouteRequestKind::Query)
-        || matches!(kind, RouteRequestKind::Add)
-            && route.gateway.is_some()
-            && route.ifindex.is_some()
-    {
-        rtmsg.hdr.rtm_addrs |= RTA_IFP;
-    }
-
-    for offset in 0..RTAX_MAX {
-        let bit = 1 << offset;
-        if rtmsg.hdr.rtm_addrs & bit == 0 {
-            continue;
-        }
-
+fn read_route(message: &Message<'_>) -> io::Result<Route> {
+    let flags = message.hdr.rtm_flags;
+    let mut route = Route::default();
+    for sockaddr in message.sockaddrs() {
+        let (bit, sockaddr) = sockaddr?;
         match bit {
-            RTA_DST => rtmsg.put_destination(&route.destination),
-            RTA_GATEWAY => {
-                if let Some(gateway) = route.gateway {
-                    rtmsg.put_gateway(&gateway);
-                } else if let Some(ifindex) = route.ifindex {
-                    rtmsg.put_index(ifindex);
-                }
+            RTA_DST => route.destination = sockaddr.ip()?,
+            RTA_GATEWAY if flags & RTF_GATEWAY != 0 => route.gateway = Some(sockaddr.ip()?),
+            // The link-layer gateway of an interface route names its interface.
+            RTA_GATEWAY if i32::from(sockaddr.family()) == AF_LINK => {
+                route.ifindex = sockaddr.link_index()?;
             }
-            RTA_NETMASK => rtmsg.put_netmask(&route.mask()),
-            RTA_IFP => rtmsg.put_index(route.ifindex.unwrap_or(0)),
+            // A netmask may be cut before its family.
+            RTA_NETMASK => {
+                let family = match route.destination {
+                    IpAddr::V4(_) => AF_INET,
+                    IpAddr::V6(_) => AF_INET6,
+                };
+                route.prefix = prefix_len(sockaddr.ip_of(family as u8)?);
+            }
+            RTA_IFP => route.ifindex = sockaddr.link_index()?.or(route.ifindex),
             _ => {}
         }
     }
-
-    rtmsg
-}
-
-fn route_flags(route: &Route, gateway: bool) -> i32 {
-    let mut flags = RTF_STATIC | RTF_UP;
-
-    if is_host_route(route) {
-        flags |= RTF_HOST;
-    }
-    if gateway {
-        flags |= RTF_GATEWAY;
-    }
-
-    flags
-}
-
-/// Apply `RTF_IFSCOPE` and `rtm_index` together for a scoped route. XNU
-/// encodes interface-scope in two coupled fields — the flag in
-/// `rtm_flags` and the ifindex in `rtm_msghdr.rtm_index` — so every
-/// request kind (ADD / DELETE / GET) needs to touch both or the kernel
-/// silently ignores the scope. Keep the coupling local to this helper
-/// so the two halves cannot drift again.
-fn apply_ifscope(hdr: &mut rt_msghdr, route: &Route) {
-    if let Some(scope) = route.scope_ifindex {
-        hdr.rtm_flags |= RTF_IFSCOPE;
-        hdr.rtm_index = scope as u16;
-    }
-}
-
-fn is_host_route(route: &Route) -> bool {
-    match route.destination {
-        std::net::IpAddr::V4(_) => route.prefix == 32,
-        std::net::IpAddr::V6(_) => route.prefix == 128,
-    }
-}
-
-fn read_route(rtmsg: &mut m_rtmsg) -> io::Result<Route> {
-    let mut ret = Route::default();
-    rtmsg.attr_len = 0;
-    for offset in 0..RTAX_MAX {
-        let bit = 1 << offset;
-        if rtmsg.hdr.rtm_addrs & bit == 0 {
-            continue;
-        }
-
-        match bit {
-            RTA_DST => ret.destination = rtmsg.get_destination()?,
-            RTA_GATEWAY => {
-                if rtmsg.hdr.rtm_flags & RTF_GATEWAY != 0 {
-                    ret.gateway = Some(rtmsg.get_gateway()?);
-                } else {
-                    rtmsg.skip_addr()?;
-                }
-            }
-            RTA_NETMASK => ret.cidr(rtmsg.get_netmask(if ret.destination.is_ipv4() {
-                AF_INET as u8
-            } else {
-                AF_INET6 as u8
-            })?),
-            RTA_IFP => ret.ifindex = Some(rtmsg.get_index()?),
-            _ => rtmsg.skip_addr()?,
-        }
+    // The kernel sends a host route without its netmask.
+    if flags & RTF_HOST != 0 {
+        route.prefix = route.max_prefix();
     }
 
     // Scope lives outside the sockaddr table: the flag is in `rtm_flags`
     // and the bound ifindex is in `rt_msghdr.rtm_index`. Reading them
     // back keeps round-trips (`add` -> `get`, `monitor` events) lossless.
-    if rtmsg.hdr.rtm_flags & RTF_IFSCOPE != 0 {
-        ret.scope_ifindex = Some(rtmsg.hdr.rtm_index as u32);
+    if flags & RTF_IFSCOPE != 0 {
+        route.scope_ifindex = Some(u32::from(message.hdr.rtm_index));
     }
 
-    rtmsg.attr_len = 0;
-    Ok(ret)
+    Ok(route)
 }
 
-fn route_msg_bytes(rtmsg: &m_rtmsg) -> &[u8] {
-    let ptr = rtmsg as *const m_rtmsg as *const u8;
-    let len = rtmsg.hdr.rtm_msglen as usize;
-
-    unsafe { std::slice::from_raw_parts(ptr, len) }
+fn netmask(route: &Route) -> IpAddr {
+    let host_bits = u32::from(route.max_prefix() - route.prefix);
+    match route.destination {
+        IpAddr::V4(_) => IpAddr::V4(Ipv4Addr::from(u32::MAX.checked_shl(host_bits).unwrap_or(0))),
+        IpAddr::V6(_) => IpAddr::V6(Ipv6Addr::from(
+            u128::MAX.checked_shl(host_bits).unwrap_or(0),
+        )),
+    }
 }
 
-fn validate_header(hdr: &rt_msghdr, expected_type: Option<u8>) -> io::Result<()> {
-    if hdr.rtm_version != RTM_VERSION as u8 {
-        return Err(io::Error::other(format!(
-            "unexpected routing message version {}",
-            hdr.rtm_version
-        )));
+fn prefix_len(netmask: IpAddr) -> u8 {
+    match netmask {
+        IpAddr::V4(netmask) => u32::from(netmask).leading_ones() as u8,
+        IpAddr::V6(netmask) => u128::from(netmask).leading_ones() as u8,
     }
-
-    if let Some(expected_type) = expected_type
-        && hdr.rtm_type != expected_type
-    {
-        return Err(io::Error::other(format!(
-            "unexpected routing message type {}",
-            hdr.rtm_type
-        )));
-    }
-
-    Ok(())
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct MessagePrefix {
-    message_type: u8,
-}
-
-fn message_prefix(bytes: &[u8]) -> io::Result<MessagePrefix> {
-    if bytes.len() < 4 {
-        return Err(io::Error::new(
-            io::ErrorKind::UnexpectedEof,
-            "truncated routing message prefix",
-        ));
-    }
-
-    let message_len = u16::from_ne_bytes([bytes[0], bytes[1]]) as usize;
-    if message_len < 4 || message_len > bytes.len() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!(
-                "invalid routing message length {message_len} for {} received bytes",
-                bytes.len()
-            ),
-        ));
-    }
-    if bytes[2] != RTM_VERSION as u8 {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!("unexpected routing message version {}", bytes[2]),
-        ));
-    }
-
-    Ok(MessagePrefix {
-        message_type: bytes[3],
-    })
-}
-
-fn code2error(err: i32) -> io::Error {
-    io::Error::from_raw_os_error(err)
 }
 
 #[cfg(test)]
 mod tests {
-    use std::{
-        collections::HashSet,
-        net::{IpAddr, Ipv4Addr},
-    };
+    use std::{collections::HashSet, mem::offset_of};
 
-    use super::*;
+    use libc::rt_msghdr;
+
+    use super::{rtmsg::HEADER_LEN, *};
+
+    fn parse(bytes: &[u8]) -> Message<'_> {
+        Message::parse(bytes).unwrap()
+    }
 
     #[test]
     fn add_by_interface_uses_link_gateway_without_ifp() {
         let route = Route::new(IpAddr::V4(Ipv4Addr::new(1, 9, 4, 5)), 32).ifindex(4);
 
-        let rtmsg = write_route_addrs(&route, RouteRequestKind::Add);
+        let bytes = request(&route, RTM_ADD, 1);
 
-        assert_eq!(rtmsg.hdr.rtm_addrs, RTA_DST | RTA_GATEWAY | RTA_NETMASK);
+        assert_eq!(
+            parse(&bytes).hdr.rtm_addrs,
+            RTA_DST | RTA_GATEWAY | RTA_NETMASK
+        );
     }
 
     #[test]
@@ -466,162 +335,158 @@ mod tests {
             .gateway(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)))
             .ifindex(4);
 
-        let rtmsg = write_route_addrs(&route, RouteRequestKind::Add);
+        let bytes = request(&route, RTM_ADD, 1);
 
         assert_eq!(
-            rtmsg.hdr.rtm_addrs,
+            parse(&bytes).hdr.rtm_addrs,
             RTA_DST | RTA_GATEWAY | RTA_NETMASK | RTA_IFP
         );
     }
 
     #[test]
-    fn query_reserves_ifp_slot() {
+    fn lookup_reserves_ifp_slot() {
         let route = Route::new(IpAddr::V4(Ipv4Addr::new(1, 9, 4, 5)), 32);
 
-        let rtmsg = write_route_addrs(&route, RouteRequestKind::Query);
+        let bytes = request(&route, RTM_GET, 1);
 
-        assert_eq!(rtmsg.hdr.rtm_addrs, RTA_DST | RTA_IFP);
+        assert_eq!(parse(&bytes).hdr.rtm_addrs, RTA_DST | RTA_IFP);
     }
 
     #[test]
     fn host_route_sets_host_flag() {
         let route = Route::new(IpAddr::V4(Ipv4Addr::new(1, 9, 4, 5)), 32);
 
-        assert_ne!(route_flags(&route, false) & RTF_HOST, 0);
+        let bytes = request(&route, RTM_DELETE, 1);
+
+        assert_ne!(parse(&bytes).hdr.rtm_flags & RTF_HOST, 0);
     }
 
     #[test]
     fn netmask_sockaddr_is_compacted_like_route_cli() {
         let route = Route::new(IpAddr::V4(Ipv4Addr::new(1, 9, 4, 5)), 24);
 
-        let rtmsg = write_route_addrs(&route, RouteRequestKind::Add);
+        let bytes = request(&route, RTM_DELETE, 1);
 
-        assert_eq!(rtmsg.attr[16] as u8, 7);
+        assert_eq!(bytes[HEADER_LEN + 16], 7);
+        assert_eq!(bytes.len(), HEADER_LEN + 16 + 8);
     }
 
     #[test]
     fn default_route_netmask_uses_empty_sockaddr_slot() {
         let route = Route::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0);
 
-        let rtmsg = write_route_addrs(&route, RouteRequestKind::Add);
+        let bytes = request(&route, RTM_DELETE, 1);
 
-        assert_eq!(rtmsg.attr[16] as u8, 0);
-        assert_eq!(rtmsg.attr_len, 20);
+        assert_eq!(bytes[HEADER_LEN + 16], 0);
+        assert_eq!(bytes.len(), HEADER_LEN + 20);
     }
 
     #[test]
-    fn apply_ifscope_sets_both_flag_and_index() {
+    fn scoped_request_sets_both_flag_and_index() {
         let route = Route::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0)
             .gateway(IpAddr::V4(Ipv4Addr::new(192, 168, 0, 1)))
             .ifscope(7);
 
-        let mut rtmsg = m_rtmsg::default();
-        rtmsg.hdr.rtm_flags = route_flags(&route, true);
-        apply_ifscope(&mut rtmsg.hdr, &route);
+        let bytes = request(&route, RTM_ADD, 1);
+        let hdr = parse(&bytes).hdr;
 
-        assert_ne!(rtmsg.hdr.rtm_flags & RTF_IFSCOPE, 0);
-        assert_eq!(rtmsg.hdr.rtm_index, 7);
+        assert_ne!(hdr.rtm_flags & RTF_IFSCOPE, 0);
+        assert_eq!(hdr.rtm_index, 7);
     }
 
     #[test]
-    fn apply_ifscope_no_scope_leaves_header_untouched() {
+    fn unscoped_request_leaves_scope_unset() {
         let route = Route::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0)
             .gateway(IpAddr::V4(Ipv4Addr::new(192, 168, 0, 1)));
 
-        let mut rtmsg = m_rtmsg::default();
-        rtmsg.hdr.rtm_flags = route_flags(&route, true);
-        apply_ifscope(&mut rtmsg.hdr, &route);
+        let bytes = request(&route, RTM_ADD, 1);
+        let hdr = parse(&bytes).hdr;
 
-        assert_eq!(rtmsg.hdr.rtm_flags & RTF_IFSCOPE, 0);
-        assert_eq!(rtmsg.hdr.rtm_index, 0);
+        assert_eq!(hdr.rtm_flags & RTF_IFSCOPE, 0);
+        assert_eq!(hdr.rtm_index, 0);
     }
 
     #[test]
     fn read_route_preserves_scope() {
-        let mut rtmsg = m_rtmsg::default();
-        rtmsg.hdr.rtm_flags = RTF_IFSCOPE;
-        rtmsg.hdr.rtm_index = 11;
-        // No sockaddr table — RTA bits are all zero, so read_route just
-        // sees the scope metadata in the header.
-        rtmsg.hdr.rtm_addrs = 0;
-        rtmsg.hdr.rtm_msglen = std::mem::size_of::<rt_msghdr>() as u16;
+        let bytes = Writer::new().finish(RTM_GET, RTF_IFSCOPE, 11, 0);
 
-        let route = read_route(&mut rtmsg).unwrap();
+        let route = read_route(&parse(&bytes)).unwrap();
+
         assert_eq!(route.scope_ifindex, Some(11));
     }
 
     #[test]
     fn read_route_without_scope_returns_none() {
-        let mut rtmsg = m_rtmsg::default();
-        rtmsg.hdr.rtm_flags = 0;
-        rtmsg.hdr.rtm_index = 42;
-        rtmsg.hdr.rtm_addrs = 0;
-        rtmsg.hdr.rtm_msglen = std::mem::size_of::<rt_msghdr>() as u16;
+        let bytes = Writer::new().finish(RTM_GET, 0, 42, 0);
 
-        let route = read_route(&mut rtmsg).unwrap();
+        let route = read_route(&parse(&bytes)).unwrap();
+
         assert_eq!(route.scope_ifindex, None);
+    }
+
+    #[test]
+    fn host_route_without_netmask_has_a_full_prefix() {
+        let mut message = Writer::new();
+        message.inet(RTA_DST, IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1)));
+        let bytes = message.finish(RTM_GET, RTF_UP | RTF_HOST, 0, 0);
+
+        let route = read_route(&parse(&bytes)).unwrap();
+
+        assert_eq!(route.prefix, 32);
+    }
+
+    #[test]
+    fn interface_route_reports_the_index_of_its_link_gateway() {
+        let route = Route::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 0)), 8).ifindex(7);
+
+        let bytes = request(&route, RTM_ADD, 1);
+
+        assert_eq!(read_route(&parse(&bytes)).unwrap(), route);
     }
 
     #[test]
     fn route_message_parser_accepts_an_unaligned_slice() {
         let expected = Route::new(IpAddr::V4(Ipv4Addr::new(10, 20, 30, 0)), 24)
             .gateway(IpAddr::V4(Ipv4Addr::new(10, 20, 30, 1)));
-        let mut wire = write_route_addrs(&expected, RouteRequestKind::Add);
-        wire.hdr.rtm_flags = RTF_GATEWAY;
-        wire.hdr.rtm_msglen = wire.len() as u16;
-
         let mut unaligned = vec![0xAA];
-        unaligned.extend_from_slice(route_msg_bytes(&wire));
-        let mut parsed = m_rtmsg::parse(&unaligned[1..]).unwrap();
+        unaligned.extend_from_slice(&request(&expected, RTM_ADD, 1));
 
-        let actual = read_route(&mut parsed).unwrap();
-        assert_eq!(actual.destination, expected.destination);
-        assert_eq!(actual.prefix, expected.prefix);
-        assert_eq!(actual.gateway, expected.gateway);
+        let actual = read_route(&parse(&unaligned[1..])).unwrap();
+
+        assert_eq!(actual, expected);
     }
 
     #[test]
     fn route_message_parser_rejects_short_and_inconsistent_lengths() {
-        let short_error = m_rtmsg::parse(&[0; 4]).err().unwrap();
+        let short_error = Message::parse(&[0; 4]).err().unwrap();
         assert_eq!(short_error.kind(), io::ErrorKind::UnexpectedEof);
 
-        let mut wire = m_rtmsg::default();
-        wire.hdr.rtm_msglen = (std::mem::size_of::<rt_msghdr>() + 1) as u16;
-        let bytes = &route_msg_bytes(&wire)[..std::mem::size_of::<rt_msghdr>()];
-        let length_error = m_rtmsg::parse(bytes).err().unwrap();
+        let mut bytes = Writer::new().finish(RTM_GET, 0, 0, 0);
+        bytes[offset_of!(rt_msghdr, rtm_msglen)..][..2]
+            .copy_from_slice(&(HEADER_LEN as u16 + 1).to_ne_bytes());
+        let length_error = Message::parse(&bytes).err().unwrap();
         assert_eq!(length_error.kind(), io::ErrorKind::InvalidData);
     }
 
     #[test]
     fn route_parser_rejects_a_declared_but_missing_attribute() {
-        let mut message = m_rtmsg::default();
-        message.hdr.rtm_msglen = std::mem::size_of::<rt_msghdr>() as u16;
-        message.hdr.rtm_addrs = RTA_DST;
+        let mut bytes = Writer::new().finish(RTM_GET, 0, 0, 0);
+        bytes[offset_of!(rt_msghdr, rtm_addrs)..][..4].copy_from_slice(&RTA_DST.to_ne_bytes());
 
-        let error = read_route(&mut message).unwrap_err();
+        let error = read_route(&parse(&bytes)).unwrap_err();
 
         assert_eq!(error.kind(), io::ErrorKind::UnexpectedEof);
     }
 
     #[test]
-    fn raw_route_errno_is_preserved() {
-        let error = code2error(libc::ENOBUFS);
-
-        assert_eq!(error.raw_os_error(), Some(libc::ENOBUFS));
-    }
-
-    #[test]
     fn routing_sequences_are_unique_across_concurrent_callers() {
-        let handles: Vec<_> = (0..32)
-            .map(|_| std::thread::spawn(next_route_sequence))
-            .collect();
+        let handles: Vec<_> = (0..32).map(|_| std::thread::spawn(next_sequence)).collect();
         let sequences: HashSet<_> = handles
             .into_iter()
             .map(|handle| handle.join().unwrap())
             .collect();
 
         assert_eq!(sequences.len(), 32);
-        assert!(sequences.iter().all(|sequence| *sequence > 0));
     }
 
     fn queued_bytes(fd: impl AsFd) -> i32 {
@@ -679,5 +544,26 @@ mod tests {
             socket.delete(&route).unwrap_err().raw_os_error(),
             Some(libc::ESRCH)
         );
+    }
+
+    #[test]
+    #[ignore = "requires root and temporarily installs a reserved test route"]
+    fn monitor_reports_an_added_and_deleted_route() {
+        let lo0 = crate::if_nametoindex("lo0").unwrap();
+        let route = Route::new(IpAddr::V4(Ipv4Addr::new(198, 18, 254, 254)), 32).ifindex(lo0);
+        let mut monitor = RouteMonitor::new().unwrap();
+        let mut socket = RouteSock::new().unwrap();
+
+        socket.add(&route).unwrap();
+        socket.delete(&route).unwrap();
+
+        let mut next = || loop {
+            let change = monitor.recv().unwrap();
+            if change.1.destination == route.destination {
+                return change;
+            }
+        };
+        assert_eq!(next(), (RouteChange::Add, route));
+        assert_eq!(next(), (RouteChange::Delete, route));
     }
 }

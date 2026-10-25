@@ -11,8 +11,8 @@ use libc::{
     sockaddr_nl,
 };
 use netlink_packet_core::{
-    NLM_F_ACK, NLM_F_CREATE, NLM_F_DUMP, NLM_F_EXCL, NLM_F_REQUEST, NetlinkHeader, NetlinkMessage,
-    NetlinkPayload,
+    ErrorMessage, NLM_F_ACK, NLM_F_CREATE, NLM_F_DUMP, NLM_F_EXCL, NLM_F_REQUEST, NetlinkHeader,
+    NetlinkMessage, NetlinkPayload,
 };
 use netlink_packet_route::{
     AddressFamily, RouteNetlinkMessage,
@@ -63,59 +63,31 @@ impl RouteSock {
     pub fn add(&mut self, route: &Route) -> io::Result<()> {
         route.validate()?;
 
-        let (sequence, port_id) = (self.next_sequence(), self.port_id);
-        let mut nl_hdr = NetlinkHeader::default();
-        nl_hdr.flags = NLM_F_REQUEST | NLM_F_EXCL | NLM_F_CREATE | NLM_F_ACK;
-        nl_hdr.sequence_number = sequence;
-        nl_hdr.port_number = port_id;
-
-        let mut rt_msg = route_change_message(route);
-        rt_msg.header.table = RouteHeader::RT_TABLE_MAIN;
+        let mut rt_msg = change_message(route);
         rt_msg.header.protocol = RouteProtocol::Boot;
-        rt_msg.header.scope = RouteScope::Universe;
         rt_msg.header.kind = RouteType::Unicast;
+        // Without a gateway, the destination is on the link of the interface.
+        rt_msg.header.scope = if route.gateway.is_none() && route.ifindex.is_some() {
+            RouteScope::Link
+        } else {
+            RouteScope::Universe
+        };
 
-        add_route_selectors(&mut rt_msg, route);
-        if route.gateway.is_none() && route.ifindex.is_some() {
-            rt_msg.header.scope = RouteScope::Link;
-        }
-
-        let mut req = NetlinkMessage::new(
-            nl_hdr,
-            NetlinkPayload::from(RouteNetlinkMessage::NewRoute(rt_msg)),
-        );
-        req.finalize();
-
-        let mut buf = [0u8; 4096];
-        req.serialize(&mut buf[..req.buffer_len()]);
-        fd::send(self.fd.as_fd(), &buf[..req.buffer_len()])?;
-        self.recv_ack(sequence, port_id)
+        let sequence = self.request(
+            NLM_F_EXCL | NLM_F_CREATE | NLM_F_ACK,
+            RouteNetlinkMessage::NewRoute(rt_msg),
+        )?;
+        self.replies(sequence, |payload| Some(ack(payload)))
     }
 
     pub fn delete(&mut self, route: &Route) -> io::Result<()> {
         route.validate()?;
 
-        let (sequence, port_id) = (self.next_sequence(), self.port_id);
-        let mut nl_hdr = NetlinkHeader::default();
-        nl_hdr.flags = NLM_F_REQUEST | NLM_F_ACK;
-        nl_hdr.sequence_number = sequence;
-        nl_hdr.port_number = port_id;
-
-        let mut rt_msg = route_change_message(route);
-        rt_msg.header.table = RouteHeader::RT_TABLE_MAIN;
+        let mut rt_msg = change_message(route);
         rt_msg.header.scope = RouteScope::NoWhere;
-        add_route_selectors(&mut rt_msg, route);
 
-        let mut req = NetlinkMessage::new(
-            nl_hdr,
-            NetlinkPayload::from(RouteNetlinkMessage::DelRoute(rt_msg)),
-        );
-        req.finalize();
-
-        let mut buf = [0u8; 4096];
-        req.serialize(&mut buf[..req.buffer_len()]);
-        fd::send(self.fd.as_fd(), &buf[..req.buffer_len()])?;
-        self.recv_ack(sequence, port_id)
+        let sequence = self.request(NLM_F_ACK, RouteNetlinkMessage::DelRoute(rt_msg))?;
+        self.replies(sequence, |payload| Some(ack(payload)))
     }
 
     pub fn get(&mut self, route: &Route) -> io::Result<Route> {
@@ -127,130 +99,80 @@ impl RouteSock {
             return self.default_route(route);
         }
 
-        let (sequence, port_id) = (self.next_sequence(), self.port_id);
-        let mut nl_hdr = NetlinkHeader::default();
-        nl_hdr.flags = NLM_F_REQUEST;
-        nl_hdr.sequence_number = sequence;
-        nl_hdr.port_number = port_id;
+        let mut rt_msg = route_message(route);
+        // Answer with the matching table entry, as macOS and Windows do, rather
+        // than with the destination as a /32 host route.
+        rt_msg.header.flags = RouteFlags::FibMatch;
 
-        let rt_msg = route_lookup_message(route);
-
-        let mut req = NetlinkMessage::new(
-            nl_hdr,
-            NetlinkPayload::from(RouteNetlinkMessage::GetRoute(rt_msg)),
-        );
-        req.finalize();
-        let mut buf = [0u8; 4096];
-        req.serialize(&mut buf[..req.buffer_len()]);
-        fd::send(self.fd.as_fd(), &buf[..req.buffer_len()])?;
-
-        self.recv_route_response(sequence, port_id)
-    }
-
-    fn next_sequence(&mut self) -> u32 {
-        self.sequence = self.sequence.wrapping_add(1).max(1);
-        self.sequence
-    }
-
-    fn recv_route_response(&mut self, sequence: u32, port_id: u32) -> io::Result<Route> {
-        loop {
-            let mut rbuf = [0u8; RECV_BUF_LEN];
-            let n = fd::recv(self.fd.as_fd(), &mut rbuf)?;
-            for nlmsg in parse_nlmsgs(&rbuf[..n])? {
-                if !response_matches(&nlmsg.header, sequence, port_id) {
-                    continue;
+        let sequence = self.request(0, RouteNetlinkMessage::GetRoute(rt_msg))?;
+        self.replies(sequence, |payload| {
+            Some(match payload {
+                NetlinkPayload::InnerMessage(RouteNetlinkMessage::NewRoute(rt_msg)) => {
+                    route_from_message(&rt_msg).ok_or_else(|| {
+                        io::Error::new(io::ErrorKind::InvalidData, "non-IP route reply")
+                    })
                 }
-
-                match nlmsg.payload {
-                    NetlinkPayload::Done(_) => {
-                        return Err(io::Error::new(io::ErrorKind::NotFound, "route not found"));
-                    }
-                    NetlinkPayload::Error(e) => {
-                        if let Some(e) = e.code {
-                            return Err(netlink_error(e));
-                        }
-                        return Err(io::Error::other("received an ACK without a route response"));
-                    }
-                    NetlinkPayload::InnerMessage(RouteNetlinkMessage::NewRoute(rt_msg)) => {
-                        return route_from_message(&rt_msg).ok_or_else(|| {
-                            io::Error::new(io::ErrorKind::InvalidData, "non-IP route response")
-                        });
-                    }
-                    payload => {
-                        return Err(io::Error::other(format!(
-                            "unexpected netlink route response: {payload:?}"
-                        )));
-                    }
-                }
-            }
-        }
+                payload => Err(unexpected_reply(payload)),
+            })
+        })
     }
 
     fn default_route(&mut self, route: &Route) -> io::Result<Route> {
-        let (sequence, port_id) = (self.next_sequence(), self.port_id);
-        let mut nl_hdr = NetlinkHeader::default();
-        nl_hdr.flags = NLM_F_REQUEST | NLM_F_DUMP;
-        nl_hdr.sequence_number = sequence;
-        nl_hdr.port_number = port_id;
-
-        let mut rt_msg = RouteMessage::default();
-        rt_msg.header.address_family = address_family(route.destination);
-
-        let mut req = NetlinkMessage::new(
-            nl_hdr,
-            NetlinkPayload::from(RouteNetlinkMessage::GetRoute(rt_msg)),
-        );
-        req.finalize();
-        let mut buf = [0u8; 4096];
-        req.serialize(&mut buf[..req.buffer_len()]);
-        fd::send(self.fd.as_fd(), &buf[..req.buffer_len()])?;
+        let mut dump = RouteMessage::default();
+        dump.header.address_family = address_family(route.destination);
+        let sequence = self.request(NLM_F_DUMP, RouteNetlinkMessage::GetRoute(dump))?;
 
         let mut best: Option<(u32, Route)> = None;
-        loop {
-            let mut rbuf = [0u8; RECV_BUF_LEN];
-            let n = fd::recv(self.fd.as_fd(), &mut rbuf)?;
-            for nlmsg in parse_nlmsgs(&rbuf[..n])? {
-                if !response_matches(&nlmsg.header, sequence, port_id) {
-                    continue;
+        self.replies(sequence, |payload| match payload {
+            NetlinkPayload::InnerMessage(RouteNetlinkMessage::NewRoute(rt_msg)) => {
+                if let Some((metric, candidate)) = default_route_candidate(&rt_msg, route)
+                    && best.is_none_or(|(best_metric, _)| metric < best_metric)
+                {
+                    best = Some((metric, candidate));
                 }
-
-                match nlmsg.payload {
-                    NetlinkPayload::Done(_) => {
-                        return best.map(|(_, route)| route).ok_or_else(|| {
-                            io::Error::new(io::ErrorKind::NotFound, "no default route")
-                        });
-                    }
-                    NetlinkPayload::Error(e) => {
-                        return Err(e.code.map_or_else(
-                            || io::Error::other("received an ACK instead of a route dump"),
-                            netlink_error,
-                        ));
-                    }
-                    NetlinkPayload::InnerMessage(RouteNetlinkMessage::NewRoute(rt_msg)) => {
-                        if let Some((metric, candidate)) = default_route_candidate(&rt_msg, route)
-                            && best
-                                .as_ref()
-                                .is_none_or(|(best_metric, _)| metric < *best_metric)
-                        {
-                            best = Some((metric, candidate));
-                        }
-                    }
-                    payload => {
-                        return Err(io::Error::other(format!(
-                            "unexpected netlink route dump: {payload:?}"
-                        )));
-                    }
-                }
+                None
             }
-        }
+            NetlinkPayload::Done(_) => Some(
+                best.map(|(_, route)| route)
+                    .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "no default route")),
+            ),
+            payload => Some(Err(unexpected_reply(payload))),
+        })
     }
 
-    fn recv_ack(&mut self, sequence: u32, port_id: u32) -> io::Result<()> {
+    /// Sends `message` as a request with `flags` and returns its sequence.
+    fn request(&mut self, flags: u16, message: RouteNetlinkMessage) -> io::Result<u32> {
+        self.sequence = self.sequence.wrapping_add(1).max(1);
+
+        let mut header = NetlinkHeader::default();
+        header.flags = NLM_F_REQUEST | flags;
+        header.sequence_number = self.sequence;
+        header.port_number = self.port_id;
+        let mut request = NetlinkMessage::new(header, NetlinkPayload::from(message));
+        request.finalize();
+
+        let mut buf = vec![0; request.buffer_len()];
+        request.serialize(&mut buf);
+        fd::send(self.fd.as_fd(), &buf)?;
+        Ok(self.sequence)
+    }
+
+    /// Feeds the replies to request `sequence` to `reply` until it returns
+    /// a result.
+    fn replies<T>(
+        &mut self,
+        sequence: u32,
+        mut reply: impl FnMut(NetlinkPayload<RouteNetlinkMessage>) -> Option<io::Result<T>>,
+    ) -> io::Result<T> {
+        let mut buf = [0u8; RECV_BUF_LEN];
         loop {
-            let mut rbuf = [0u8; RECV_BUF_LEN];
-            let n = fd::recv(self.fd.as_fd(), &mut rbuf)?;
-            if let Some(result) = ack_from_messages(&parse_nlmsgs(&rbuf[..n])?, sequence, port_id) {
-                return result;
+            let n = fd::recv(self.fd.as_fd(), &mut buf)?;
+            for message in parse_nlmsgs(&buf[..n])? {
+                if response_matches(&message.header, sequence, self.port_id)
+                    && let Some(result) = reply(message.payload)
+                {
+                    return result;
+                }
             }
         }
     }
@@ -347,7 +269,8 @@ fn netlink_error(code: NonZeroI32) -> io::Error {
     io::Error::from_raw_os_error(if raw < 0 { -raw } else { raw })
 }
 
-fn route_change_message(route: &Route) -> RouteMessage {
+/// A message that selects `route` by destination and interface.
+fn route_message(route: &Route) -> RouteMessage {
     let mut rt_msg = RouteMessage::default();
     rt_msg.header.address_family = address_family(route.destination);
     rt_msg.header.destination_prefix_length = route.prefix;
@@ -356,37 +279,22 @@ fn route_change_message(route: &Route) -> RouteMessage {
         .push(RouteAttribute::Destination(route_address(
             route.destination,
         )));
+    if let Some(index) = route.ifindex {
+        rt_msg.attributes.push(RouteAttribute::Oif(index));
+    }
+
     rt_msg
 }
 
-fn add_route_selectors(rt_msg: &mut RouteMessage, route: &Route) {
+/// A message that adds `route` to or deletes it from the main table.
+fn change_message(route: &Route) -> RouteMessage {
+    let mut rt_msg = route_message(route);
+    rt_msg.header.table = RouteHeader::RT_TABLE_MAIN;
     if let Some(gateway) = route.gateway {
         rt_msg
             .attributes
             .push(RouteAttribute::Gateway(route_address(gateway)));
     }
-
-    if let Some(index) = route.ifindex {
-        rt_msg.attributes.push(RouteAttribute::Oif(index));
-    }
-}
-
-fn route_lookup_message(route: &Route) -> RouteMessage {
-    let mut rt_msg = RouteMessage::default();
-    rt_msg.header.address_family = address_family(route.destination);
-    rt_msg.header.destination_prefix_length = route.prefix;
-    rt_msg
-        .attributes
-        .push(RouteAttribute::Destination(route_address(
-            route.destination,
-        )));
-
-    if let Some(index) = route.ifindex {
-        rt_msg.attributes.push(RouteAttribute::Oif(index));
-    }
-    // Answer with the matching table entry, as macOS and Windows do, rather
-    // than with the destination as a /32 host route.
-    rt_msg.header.flags = RouteFlags::FibMatch;
 
     rt_msg
 }
@@ -497,23 +405,22 @@ fn response_matches(header: &NetlinkHeader, sequence: u32, port_id: u32) -> bool
     header.port_number == port_id && header.sequence_number == sequence
 }
 
-fn ack_from_messages(
-    messages: &[NetlinkMessage<RouteNetlinkMessage>],
-    sequence: u32,
-    port_id: u32,
-) -> Option<io::Result<()>> {
-    messages
-        .iter()
-        .find(|message| response_matches(&message.header, sequence, port_id))
-        .map(|message| match &message.payload {
-            NetlinkPayload::Error(error) => match error.code {
-                Some(code) => Err(netlink_error(code)),
-                None => Ok(()),
-            },
-            payload => Err(io::Error::other(format!(
-                "unexpected netlink ACK response: {payload:?}"
-            ))),
-        })
+fn ack(payload: NetlinkPayload<RouteNetlinkMessage>) -> io::Result<()> {
+    match payload {
+        NetlinkPayload::Error(error) if error.code.is_none() => Ok(()),
+        payload => Err(unexpected_reply(payload)),
+    }
+}
+
+/// The error for a reply other than the expected one: the kernel's own, if
+/// it reports one.
+fn unexpected_reply(payload: NetlinkPayload<RouteNetlinkMessage>) -> io::Error {
+    match payload {
+        NetlinkPayload::Error(ErrorMessage {
+            code: Some(code), ..
+        }) => netlink_error(code),
+        payload => io::Error::other(format!("unexpected netlink reply: {payload:?}")),
+    }
 }
 
 fn enqueue_route_changes(
@@ -595,8 +502,6 @@ const fn nl_mgrp(group: u32) -> u32 {
 mod tests {
     use std::{collections::VecDeque, net::Ipv4Addr};
 
-    use netlink_packet_core::ErrorMessage;
-
     use super::*;
 
     fn message(
@@ -612,20 +517,18 @@ mod tests {
         message
     }
 
-    fn ack(
+    fn ack_message(
         sequence: u32,
         port_number: u32,
         error: Option<i32>,
     ) -> NetlinkMessage<RouteNetlinkMessage> {
-        let mut ack = ErrorMessage::default();
-        ack.code = error.and_then(NonZeroI32::new);
-        message(sequence, port_number, NetlinkPayload::Error(ack))
+        let mut error_message = ErrorMessage::default();
+        error_message.code = error.and_then(NonZeroI32::new);
+        message(sequence, port_number, NetlinkPayload::Error(error_message))
     }
 
     fn main_table_message(route: &Route) -> RouteMessage {
-        let mut rt_msg = route_change_message(route);
-        add_route_selectors(&mut rt_msg, route);
-        rt_msg.header.table = RouteHeader::RT_TABLE_MAIN;
+        let mut rt_msg = change_message(route);
         rt_msg.header.kind = RouteType::Unicast;
         rt_msg
     }
@@ -681,13 +584,14 @@ mod tests {
     }
 
     #[test]
-    fn ack_filter_skips_foreign_messages_and_preserves_kernel_errors() {
-        let messages = [ack(9, 123, None), ack(8, 777, None), ack(9, 777, None)];
-        assert!(ack_from_messages(&messages, 9, 777).unwrap().is_ok());
+    fn ack_accepts_only_success_and_preserves_kernel_errors() {
+        assert!(ack(ack_message(9, 777, None).payload).is_ok());
 
-        let messages = [ack(9, 777, Some(-libc::EPERM))];
-        let error = ack_from_messages(&messages, 9, 777).unwrap().unwrap_err();
+        let error = ack(ack_message(9, 777, Some(-libc::EPERM)).payload).unwrap_err();
         assert_eq!(error.raw_os_error(), Some(libc::EPERM));
+
+        let reply = route_message(Ipv4Addr::new(10, 0, 0, 1), false);
+        assert!(ack(reply.payload).unwrap_err().raw_os_error().is_none());
     }
 
     #[test]
@@ -772,15 +676,13 @@ mod tests {
     }
 
     #[test]
-    fn delete_message_keeps_nowhere_scope_and_includes_selectors() {
+    fn change_message_selects_the_main_table_route() {
         let route = Route::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 0)), 24)
             .gateway(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)))
             .ifindex(7);
-        let mut message = route_change_message(&route);
-        message.header.scope = RouteScope::NoWhere;
-        add_route_selectors(&mut message, &route);
+        let message = change_message(&route);
 
-        assert_eq!(message.header.scope, RouteScope::NoWhere);
+        assert_eq!(message.header.table, RouteHeader::RT_TABLE_MAIN);
         assert!(message.attributes.iter().any(|attribute| {
             matches!(attribute, RouteAttribute::Gateway(RouteAddress::Inet(address)) if *address == Ipv4Addr::new(10, 0, 0, 1))
         }));

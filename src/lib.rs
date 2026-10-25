@@ -65,37 +65,16 @@ impl Route {
         }
     }
 
-    #[cfg(target_os = "macos")]
-    pub(crate) fn mask(&self) -> IpAddr {
-        use std::net::{Ipv4Addr, Ipv6Addr};
-
+    /// The prefix length of a host route to `destination`.
+    pub(crate) fn max_prefix(&self) -> u8 {
         match self.destination {
-            IpAddr::V4(_) => IpAddr::V4(Ipv4Addr::from(
-                u32::MAX.checked_shl(32 - self.prefix as u32).unwrap_or(0),
-            )),
-            IpAddr::V6(_) => IpAddr::V6(Ipv6Addr::from(
-                u128::MAX.checked_shl(128 - self.prefix as u32).unwrap_or(0),
-            )),
-        }
-    }
-
-    #[cfg(target_os = "macos")]
-    pub(crate) fn cidr(&mut self, netmask: IpAddr) {
-        use std::net::{Ipv4Addr, Ipv6Addr};
-
-        self.prefix = match netmask {
-            IpAddr::V4(netmask) => <Ipv4Addr as Into<u32>>::into(netmask).leading_ones() as u8,
-            IpAddr::V6(netmask) => <Ipv6Addr as Into<u128>>::into(netmask).leading_ones() as u8,
+            IpAddr::V4(_) => 32,
+            IpAddr::V6(_) => 128,
         }
     }
 
     pub(crate) fn validate(&self) -> io::Result<()> {
-        let max_prefix = match self.destination {
-            IpAddr::V4(_) => 32,
-            IpAddr::V6(_) => 128,
-        };
-
-        if self.prefix > max_prefix {
+        if self.prefix > self.max_prefix() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 format!("invalid prefix {} for {}", self.prefix, self.destination),
