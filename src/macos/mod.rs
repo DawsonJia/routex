@@ -61,12 +61,15 @@ impl RouteSock {
         Ok(Self { fd })
     }
 
+    /// Adds `route`; fails with `EEXIST` if it is there.
     pub fn add(&mut self, route: &Route) -> io::Result<()> {
         route.validate()?;
 
         fd::send(self.fd.as_fd(), &request(route, RTM_ADD, next_sequence()))
     }
 
+    /// Deletes the route to `route.destination/prefix`, in the scope of
+    /// `route.scope_ifindex` if it is set.
     pub fn delete(&mut self, route: &Route) -> io::Result<()> {
         route.validate()?;
 
@@ -76,6 +79,8 @@ impl RouteSock {
         )
     }
 
+    /// The table entry the kernel routes `route.destination` by, in the scope
+    /// of `route.scope_ifindex` if it is set.
     pub fn get(&mut self, route: &Route) -> io::Result<Route> {
         route.validate()?;
 

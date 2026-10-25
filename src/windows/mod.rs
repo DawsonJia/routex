@@ -33,6 +33,8 @@ impl RouteSock {
         Ok(Self)
     }
 
+    /// Adds `route`. Without an interface, it goes out of the one of the best
+    /// route to its gateway, or else to its destination.
     pub fn add(&mut self, route: &Route) -> io::Result<()> {
         route.validate()?;
 
@@ -41,6 +43,8 @@ impl RouteSock {
         win32_result(unsafe { CreateIpForwardEntry2(&row) })
     }
 
+    /// Deletes the one route that `route` selects by destination, and by
+    /// gateway and interface where they are set.
     pub fn delete(&mut self, route: &Route) -> io::Result<()> {
         route.validate()?;
 
@@ -48,6 +52,9 @@ impl RouteSock {
         win32_result(unsafe { DeleteIpForwardEntry2(&row) })
     }
 
+    /// The best route to `route.destination`, out of `route.ifindex` if it is
+    /// set. The unspecified address with prefix 0 asks for the default route,
+    /// through the gateway and interface of `route` where they are set.
     pub fn get(&mut self, route: &Route) -> io::Result<Route> {
         route.validate()?;
 

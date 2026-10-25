@@ -60,6 +60,7 @@ impl RouteSock {
         })
     }
 
+    /// Adds `route` to the main table; fails with `EEXIST` if it is there.
     pub fn add(&mut self, route: &Route) -> io::Result<()> {
         route.validate()?;
 
@@ -80,6 +81,8 @@ impl RouteSock {
         self.replies(sequence, |payload| Some(ack(payload)))
     }
 
+    /// Deletes the main-table route to `route.destination/prefix`, through
+    /// the gateway and interface of `route` where they are set.
     pub fn delete(&mut self, route: &Route) -> io::Result<()> {
         route.validate()?;
 
@@ -90,6 +93,10 @@ impl RouteSock {
         self.replies(sequence, |payload| Some(ack(payload)))
     }
 
+    /// The table entry the kernel routes `route.destination` by, out of
+    /// `route.ifindex` if it is set. The unspecified address with prefix 0
+    /// asks for the main-table default route, through the gateway and
+    /// interface of `route` where they are set.
     pub fn get(&mut self, route: &Route) -> io::Result<Route> {
         route.validate()?;
 

@@ -1,3 +1,5 @@
+#![doc = include_str!("../README.md")]
+
 use std::{ffi::CString, io, net::IpAddr};
 
 // Keep raw syscalls inside this crate. Exporting a macro that supplies its own
@@ -32,11 +34,16 @@ pub use macos::{RouteMonitor, RouteSock};
 #[cfg(target_os = "windows")]
 pub use windows::{RouteSock, if_friendly_name_to_index};
 
+/// A route: traffic to `destination/prefix` goes through `gateway`, or
+/// straight out of interface `ifindex`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Route {
     pub destination: IpAddr,
     pub prefix: u8,
+    /// The next hop, of the family of `destination`.
     pub gateway: Option<IpAddr>,
+    /// The outgoing interface. Without a gateway, the destination is on its
+    /// link.
     pub ifindex: Option<u32>,
     /// macOS interface-scoped routing (`RTF_IFSCOPE`). When set, the route
     /// is only matched by lookups whose `IP_BOUND_IF` scope equals this
@@ -47,6 +54,7 @@ pub struct Route {
     pub scope_ifindex: Option<u32>,
 }
 
+/// The IPv4 default route, `0.0.0.0/0`.
 impl Default for Route {
     fn default() -> Self {
         Route::new(IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED), 0)
@@ -124,6 +132,7 @@ pub enum RouteChange {
     Change,
 }
 
+/// The index of the interface named `name`.
 pub fn if_nametoindex(name: &str) -> Option<u32> {
     let name = CString::new(name).ok()?;
 
