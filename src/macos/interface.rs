@@ -469,7 +469,7 @@ mod tests {
         );
     }
 
-    /// A `utun` interface, point-to-point and down, which goes with its
+    /// A `utun` interface, which is point-to-point and goes with its
     /// socket.
     struct Utun {
         index: u32,
@@ -715,6 +715,7 @@ mod tests {
     #[ignore = "requires root, and configures a utun interface of its own"]
     fn a_link_takes_an_mtu_and_goes_up_and_down() {
         let utun = utun();
+        set_up(utun.index, false).unwrap();
         assert!(!is_up(utun.index));
 
         set_mtu(utun.index, 1400).unwrap();

@@ -160,9 +160,9 @@ impl Handle {
         )
     }
 
-    /// Deletes the address `address.ip/prefix` from its interface: for
-    /// IPv4, the first whose peer, or else itself, is in the prefix of that
-    /// of `address`. Fails with `NotFound` if there is none.
+    /// Deletes the address `address.ip/prefix` from its interface; fails
+    /// with `NotFound` if there is none. An IPv4 address is deleted by its
+    /// peer as well, and an IPv6 one whatever its peer.
     pub fn delete_address(&mut self, address: &Address) -> io::Result<()> {
         address.validate()?;
 
