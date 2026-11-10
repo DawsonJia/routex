@@ -22,7 +22,7 @@ use rtmsg::{MESSAGE_CAPACITY, Message, Writer, message_type};
 /// bindings, so define it locally from the XNU value (`net/route.h`).
 const RTF_IFSCOPE: i32 = 0x1000000;
 
-/// A `get` reply is told apart by the pid and sequence of its request, so
+/// A `get_route` reply is told apart by the pid and sequence of its request, so
 /// sequences are unique across the sockets of the process.
 static ROUTE_SEQUENCE: AtomicI32 = AtomicI32::new(0);
 
@@ -31,26 +31,26 @@ static ROUTE_SEQUENCE: AtomicI32 = AtomicI32::new(0);
 /// this long.
 const REPLY_TIMEOUT: Duration = Duration::from_secs(1);
 
-/// A routing socket that changes and queries the routing table. `add` and
-/// `delete` use it, so options set through [`AsRawFd`] apply to them; every
-/// `get` opens a socket of its own.
-pub struct RouteSock {
+/// A routing socket that changes and queries the routing table.
+/// `add_route` and `delete_route` use it, so options set through
+/// [`AsRawFd`] apply to them; every `get_route` opens a socket of its own.
+pub struct Handle {
     fd: OwnedFd,
 }
 
-impl AsFd for RouteSock {
+impl AsFd for Handle {
     fn as_fd(&self) -> BorrowedFd<'_> {
         self.fd.as_fd()
     }
 }
 
-impl AsRawFd for RouteSock {
+impl AsRawFd for Handle {
     fn as_raw_fd(&self) -> RawFd {
         self.fd.as_raw_fd()
     }
 }
 
-impl RouteSock {
+impl Handle {
     pub fn new() -> io::Result<Self> {
         let fd = open()?;
         // A change fails in its own write. Like `route add`, the socket reads
@@ -62,7 +62,7 @@ impl RouteSock {
     }
 
     /// Adds `route`; fails with `EEXIST` if it is there.
-    pub fn add(&mut self, route: &Route) -> io::Result<()> {
+    pub fn add_route(&mut self, route: &Route) -> io::Result<()> {
         route.validate()?;
 
         fd::send(self.fd.as_fd(), &request(route, RTM_ADD, next_sequence()))
@@ -70,7 +70,7 @@ impl RouteSock {
 
     /// Deletes the route to `route.destination/prefix`, in the scope of
     /// `route.scope_ifindex` if it is set.
-    pub fn delete(&mut self, route: &Route) -> io::Result<()> {
+    pub fn delete_route(&mut self, route: &Route) -> io::Result<()> {
         route.validate()?;
 
         fd::send(
@@ -81,7 +81,7 @@ impl RouteSock {
 
     /// The table entry the kernel routes `route.destination` by, in the scope
     /// of `route.scope_ifindex` if it is set.
-    pub fn get(&mut self, route: &Route) -> io::Result<Route> {
+    pub fn get_route(&mut self, route: &Route) -> io::Result<Route> {
         route.validate()?;
 
         // Every routing socket receives every routing message on the host, so
@@ -285,7 +285,7 @@ fn read_route(message: &Message<'_>) -> io::Result<Route> {
 
     // Scope lives outside the sockaddr table: the flag is in `rtm_flags`
     // and the bound ifindex is in `rt_msghdr.rtm_index`. Reading them
-    // back keeps round-trips (`add` -> `get`, `monitor` events) lossless.
+    // back keeps round-trips (`add_route` -> `get_route`, `RouteMonitor` events) lossless.
     if flags & RTF_IFSCOPE != 0 {
         route.scope_ifindex = Some(u32::from(message.hdr.rtm_index));
     }
@@ -505,7 +505,7 @@ mod tests {
     fn get_answers_while_routing_sockets_are_full() {
         let route = Route::default();
         let full = open().unwrap();
-        let mut socket = RouteSock::new().unwrap();
+        let mut handle = Handle::new().unwrap();
         let mut capacity = 0;
         let mut capacity_len = std::mem::size_of_val(&capacity) as libc::socklen_t;
         syscall!(getsockopt(
@@ -520,7 +520,7 @@ mod tests {
         // Every reply reaches every routing socket, until one no longer fits.
         let dropped = (0..10_000).any(|_| {
             let queued = queued_bytes(&full);
-            socket.get(&route).unwrap();
+            handle.get_route(&route).unwrap();
             queued_bytes(&full) == queued
         });
         assert!(
@@ -528,8 +528,8 @@ mod tests {
             "the replies never filled the receive buffer"
         );
 
-        socket.get(&route).unwrap();
-        assert_eq!(queued_bytes(&socket), 0);
+        handle.get_route(&route).unwrap();
+        assert_eq!(queued_bytes(&handle), 0);
     }
 
     #[test]
@@ -537,16 +537,16 @@ mod tests {
     fn mutation_write_reports_duplicate_and_missing_route_errors_without_echo() {
         let route = Route::new(IpAddr::V4(Ipv4Addr::new(198, 18, 255, 254)), 32)
             .ifindex(crate::if_nametoindex("lo0").unwrap());
-        let mut socket = RouteSock::new().unwrap();
+        let mut handle = Handle::new().unwrap();
 
-        socket.add(&route).unwrap();
-        let duplicate = socket.add(&route);
-        let cleanup = socket.delete(&route);
+        handle.add_route(&route).unwrap();
+        let duplicate = handle.add_route(&route);
+        let cleanup = handle.delete_route(&route);
 
         cleanup.unwrap();
         assert_eq!(duplicate.unwrap_err().raw_os_error(), Some(libc::EEXIST));
         assert_eq!(
-            socket.delete(&route).unwrap_err().raw_os_error(),
+            handle.delete_route(&route).unwrap_err().raw_os_error(),
             Some(libc::ESRCH)
         );
     }
@@ -557,10 +557,10 @@ mod tests {
         let lo0 = crate::if_nametoindex("lo0").unwrap();
         let route = Route::new(IpAddr::V4(Ipv4Addr::new(198, 18, 254, 254)), 32).ifindex(lo0);
         let mut monitor = RouteMonitor::new().unwrap();
-        let mut socket = RouteSock::new().unwrap();
+        let mut handle = Handle::new().unwrap();
 
-        socket.add(&route).unwrap();
-        socket.delete(&route).unwrap();
+        handle.add_route(&route).unwrap();
+        handle.delete_route(&route).unwrap();
 
         let mut next = || loop {
             let change = monitor.recv().unwrap();

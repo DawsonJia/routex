@@ -7,7 +7,7 @@
 
 use std::{env, error::Error, net::IpAddr};
 
-use routex::{Route, RouteSock, if_nametoindex};
+use routex::{Handle, Route, if_nametoindex};
 
 const USAGE: &str =
     "usage: route <add|delete|get> <destination>[/<prefix>] [via <gateway>] [dev <interface>]";
@@ -30,11 +30,11 @@ fn main() -> Result<(), Box<dyn Error>> {
         };
     }
 
-    let mut sock = RouteSock::new()?;
+    let mut handle = Handle::new()?;
     match command.as_str() {
-        "add" => sock.add(&route)?,
-        "delete" => sock.delete(&route)?,
-        "get" => println!("{:?}", sock.get(&route)?),
+        "add" => handle.add_route(&route)?,
+        "delete" => handle.delete_route(&route)?,
+        "get" => println!("{:?}", handle.get_route(&route)?),
         _ => return Err(USAGE.into()),
     }
     Ok(())

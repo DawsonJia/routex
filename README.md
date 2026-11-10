@@ -5,17 +5,17 @@ Add, delete, look up and monitor IP routes on Linux, macOS and Windows.
 | | Linux | macOS | Windows |
 | --- | --- | --- | --- |
 | Backend | rtnetlink | routing socket, `route(4)` | IP Helper |
-| `RouteSock::add`, `delete`, `get` | yes | yes | yes |
+| `Handle::add_route`, `delete_route`, `get_route` | yes | yes | yes |
 | `RouteMonitor` | yes | yes | no |
 
 ```rust,no_run
-use routex::{Route, RouteSock};
+use routex::{Handle, Route};
 
 fn main() -> std::io::Result<()> {
-    let mut sock = RouteSock::new()?;
+    let mut handle = Handle::new()?;
 
     // The unspecified address with prefix 0 asks for the default route.
-    let default = sock.get(&Route::default())?;
+    let default = handle.get_route(&Route::default())?;
     // Through the gateway of the default route, and out of its interface; a
     // default route on a point-to-point link may have no gateway.
     let route = Route {
@@ -24,8 +24,8 @@ fn main() -> std::io::Result<()> {
         ..default
     };
 
-    sock.add(&route)?;
-    sock.delete(&route)
+    handle.add_route(&route)?;
+    handle.delete_route(&route)
 }
 ```
 
@@ -36,20 +36,20 @@ settings.
 
 ## Semantics
 
-- `get` tells how the kernel routes the destination: the gateway and interface
+- `get_route` tells how the kernel routes the destination: the gateway and interface
   it picks. The destination and prefix it reports are the platform's own: the
   matching table entry on Windows, that entry or a host route cloned from it on
   macOS, and the destination as a host route on Linux. It honours `ifindex` on
   Linux and Windows, and `scope_ifindex` on macOS.
-- `get` of the unspecified address with prefix 0 returns the default route. On
+- `get_route` of the unspecified address with prefix 0 returns the default route. On
   Linux that is the main-table one with the lowest metric, through its live
   next hop that `gateway` and `ifindex` select; one with several such next
   hops, or with a nexthop object the kernel does not expand, is an error, as a
   `Route` holds a single next hop.
 - A `Route` holds a gateway of the family of its destination, so on Linux a
   route through a gateway of another family, an IPv4 route through an IPv6
-  one, is an error for `get` and skipped by `RouteMonitor`.
-- On Linux, `add`, `delete` and `RouteMonitor` work on the main table only. The
+  one, is an error for `get_route` and skipped by `RouteMonitor`.
+- On Linux, `add_route`, `delete_route` and `RouteMonitor` work on the main table only. The
   monitor reports every route of it, blackholes included; a multipath route
   without its gateways and interfaces.
 - On macOS, `Route::ifscope` installs an interface-scoped route

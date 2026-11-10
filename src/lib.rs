@@ -28,11 +28,11 @@ mod macos;
 mod windows;
 
 #[cfg(target_os = "linux")]
-pub use linux::{RouteMonitor, RouteSock};
+pub use linux::{Handle, RouteMonitor};
 #[cfg(target_os = "macos")]
-pub use macos::{RouteMonitor, RouteSock};
+pub use macos::{Handle, RouteMonitor};
 #[cfg(target_os = "windows")]
-pub use windows::{RouteSock, if_friendly_name_to_index};
+pub use windows::{Handle, if_friendly_name_to_index};
 
 /// A route: traffic to `destination/prefix` goes through `gateway`, or
 /// straight out of interface `ifindex`.

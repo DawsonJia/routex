@@ -29,25 +29,25 @@ use crate::{Route, RouteChange, fd};
 const RECV_BUF_LEN: usize = 16384;
 
 /// A netlink socket that changes and queries the main routing table.
-pub struct RouteSock {
+pub struct Handle {
     fd: OwnedFd,
     port_id: u32,
     sequence: u32,
 }
 
-impl AsFd for RouteSock {
+impl AsFd for Handle {
     fn as_fd(&self) -> BorrowedFd<'_> {
         self.fd.as_fd()
     }
 }
 
-impl AsRawFd for RouteSock {
+impl AsRawFd for Handle {
     fn as_raw_fd(&self) -> RawFd {
         self.fd.as_raw_fd()
     }
 }
 
-impl RouteSock {
+impl Handle {
     pub fn new() -> io::Result<Self> {
         let fd = socket()?;
         bind(fd.as_fd(), 0)?;
@@ -61,7 +61,7 @@ impl RouteSock {
     }
 
     /// Adds `route` to the main table; fails with `EEXIST` if it is there.
-    pub fn add(&mut self, route: &Route) -> io::Result<()> {
+    pub fn add_route(&mut self, route: &Route) -> io::Result<()> {
         route.validate()?;
 
         let mut rt_msg = change_message(route);
@@ -83,7 +83,7 @@ impl RouteSock {
 
     /// Deletes the main-table route to `route.destination/prefix`, through
     /// the gateway and interface of `route` where they are set.
-    pub fn delete(&mut self, route: &Route) -> io::Result<()> {
+    pub fn delete_route(&mut self, route: &Route) -> io::Result<()> {
         route.validate()?;
 
         let mut rt_msg = change_message(route);
@@ -99,7 +99,7 @@ impl RouteSock {
     /// main-table default route instead, through the gateway and interface of
     /// `route` where they are set; one that leaves through several live next
     /// hops, or a nexthop object, is an error.
-    pub fn get(&mut self, route: &Route) -> io::Result<Route> {
+    pub fn get_route(&mut self, route: &Route) -> io::Result<Route> {
         route.validate()?;
 
         // The kernel answers a lookup of the unspecified address with the
@@ -726,17 +726,17 @@ mod tests {
             }
         });
 
-        let mut socket = RouteSock {
+        let mut handle = Handle {
             fd: client.into(),
             port_id: 42,
             sequence: 0,
         };
-        let route = socket.get(&query);
+        let route = handle.get_route(&query);
         kernel.join().unwrap();
 
         let mut byte = 0u8;
         let unread = syscall!(recv(
-            socket.as_raw_fd(),
+            handle.as_raw_fd(),
             (&mut byte as *mut u8).cast(),
             1,
             libc::MSG_DONTWAIT
@@ -1138,9 +1138,9 @@ mod tests {
     #[test]
     #[ignore = "black-box check against the live Linux routing table"]
     fn default_route_lookup_returns_the_default_route() {
-        let mut socket = RouteSock::new().unwrap();
+        let mut handle = Handle::new().unwrap();
 
-        let route = socket.get(&Route::default()).unwrap();
+        let route = handle.get_route(&Route::default()).unwrap();
 
         assert_eq!(route.destination, IpAddr::V4(Ipv4Addr::UNSPECIFIED));
         assert_eq!(route.prefix, 0);
@@ -1153,12 +1153,12 @@ mod tests {
     fn add_get_delete_round_trip_through_the_main_table() {
         let lo = crate::if_nametoindex("lo").unwrap();
         let route = Route::new(IpAddr::V4(Ipv4Addr::new(198, 18, 255, 0)), 24).ifindex(lo);
-        let mut socket = RouteSock::new().unwrap();
+        let mut handle = Handle::new().unwrap();
 
-        socket.add(&route).unwrap();
-        let duplicate = socket.add(&route);
-        let found = socket.get(&Route::new(IpAddr::V4(Ipv4Addr::new(198, 18, 255, 7)), 32));
-        let cleanup = socket.delete(&route);
+        handle.add_route(&route).unwrap();
+        let duplicate = handle.add_route(&route);
+        let found = handle.get_route(&Route::new(IpAddr::V4(Ipv4Addr::new(198, 18, 255, 7)), 32));
+        let cleanup = handle.delete_route(&route);
 
         cleanup.unwrap();
         assert_eq!(duplicate.unwrap_err().raw_os_error(), Some(libc::EEXIST));
@@ -1168,7 +1168,7 @@ mod tests {
             Route::new(IpAddr::V4(Ipv4Addr::new(198, 18, 255, 7)), 32).ifindex(lo)
         );
         assert_eq!(
-            socket.delete(&route).unwrap_err().raw_os_error(),
+            handle.delete_route(&route).unwrap_err().raw_os_error(),
             Some(libc::ESRCH)
         );
     }
@@ -1179,10 +1179,10 @@ mod tests {
         let lo = crate::if_nametoindex("lo").unwrap();
         let route = Route::new(IpAddr::V4(Ipv4Addr::new(198, 18, 254, 0)), 24).ifindex(lo);
         let mut monitor = RouteMonitor::new().unwrap();
-        let mut socket = RouteSock::new().unwrap();
+        let mut handle = Handle::new().unwrap();
 
-        socket.add(&route).unwrap();
-        socket.delete(&route).unwrap();
+        handle.add_route(&route).unwrap();
+        handle.delete_route(&route).unwrap();
 
         let mut next = || loop {
             let change = monitor.recv().unwrap();

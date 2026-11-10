@@ -26,16 +26,16 @@ use crate::Route;
 
 /// Changes and queries the routing table through the IP Helper API.
 // TODO: a `RouteMonitor` backed by NotifyRouteChange2.
-pub struct RouteSock;
+pub struct Handle;
 
-impl RouteSock {
+impl Handle {
     pub fn new() -> io::Result<Self> {
         Ok(Self)
     }
 
     /// Adds `route`. Without an interface, it goes out of the one of the best
     /// route to its gateway, or else to its destination.
-    pub fn add(&mut self, route: &Route) -> io::Result<()> {
+    pub fn add_route(&mut self, route: &Route) -> io::Result<()> {
         route.validate()?;
 
         let mut row = route_row(route);
@@ -45,7 +45,7 @@ impl RouteSock {
 
     /// Deletes the one route that `route` selects by destination, and by
     /// gateway and interface where they are set.
-    pub fn delete(&mut self, route: &Route) -> io::Result<()> {
+    pub fn delete_route(&mut self, route: &Route) -> io::Result<()> {
         route.validate()?;
 
         let row = find_unique_route(route)?;
@@ -55,7 +55,7 @@ impl RouteSock {
     /// The best route to `route.destination`, out of `route.ifindex` if it is
     /// set. The unspecified address with prefix 0 asks for the default route,
     /// through the gateway and interface of `route` where they are set.
-    pub fn get(&mut self, route: &Route) -> io::Result<Route> {
+    pub fn get_route(&mut self, route: &Route) -> io::Result<Route> {
         route.validate()?;
 
         // GetBestRoute2 treats an unspecified destination as a lookup target, not as "show default route".
