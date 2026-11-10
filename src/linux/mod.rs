@@ -1461,78 +1461,108 @@ mod tests {
         assert_ne!(route.ifindex, crate::if_nametoindex("lo"));
     }
 
-    /// A handle in a network namespace of the calling thread's own, with
-    /// `lo` up. libtest runs each test on a thread of its own, so a live test
-    /// that changes routes and rules there can neither touch the host's nor
-    /// leave its own behind: the namespace goes with the test.
-    fn isolated() -> Handle {
-        syscall!(unshare(libc::CLONE_NEWNET)).unwrap();
+    /// Runs `test` with a handle in a network namespace of its own, with
+    /// `lo` up, on a thread of its own, which the namespace goes with. A live
+    /// test that changes routes and rules there can neither touch the host's
+    /// nor leave its own behind, and the thread that runs it, which libtest
+    /// may share between tests, keeps its namespace.
+    fn isolated(test: impl FnOnce(Handle) + Send) {
+        std::thread::scope(|scope| {
+            let thread = std::thread::Builder::new()
+                .spawn_scoped(scope, || {
+                    syscall!(unshare(libc::CLONE_NEWNET)).unwrap();
 
-        let mut lo = LinkMessage::default();
-        lo.header.index = crate::if_nametoindex("lo").unwrap();
-        lo.header.flags = LinkFlags::Up;
-        lo.header.change_mask = LinkFlags::Up;
-        let mut handle = Handle::new().unwrap();
-        let sequence = handle
-            .request(NLM_F_ACK, RouteNetlinkMessage::SetLink(lo))
-            .unwrap();
-        handle
-            .replies(sequence, |message| Some(ack(message.payload)))
-            .unwrap();
-        handle
+                    let mut lo = LinkMessage::default();
+                    lo.header.index = crate::if_nametoindex("lo").unwrap();
+                    lo.header.flags = LinkFlags::Up;
+                    lo.header.change_mask = LinkFlags::Up;
+                    let mut handle = Handle::new().unwrap();
+                    let sequence = handle
+                        .request(NLM_F_ACK, RouteNetlinkMessage::SetLink(lo))
+                        .unwrap();
+                    handle
+                        .replies(sequence, |message| Some(ack(message.payload)))
+                        .unwrap();
+
+                    test(handle)
+                })
+                .expect("no thread for a network namespace of its own");
+            if let Err(panic) = thread.join() {
+                std::panic::resume_unwind(panic);
+            }
+        });
+    }
+
+    fn network_namespace() -> std::path::PathBuf {
+        std::fs::read_link("/proc/thread-self/ns/net").unwrap()
+    }
+
+    #[test]
+    #[ignore = "requires root to make a network namespace"]
+    fn an_isolated_test_leaves_the_namespace_of_its_caller_alone() {
+        let caller = network_namespace();
+
+        isolated(|_| assert_ne!(network_namespace(), caller));
+        let failed = std::panic::catch_unwind(|| isolated(|_| panic!("in the namespace")));
+
+        assert_eq!(network_namespace(), caller);
+        let panic = failed.unwrap_err();
+        assert_eq!(panic.downcast_ref::<&str>(), Some(&"in the namespace"));
     }
 
     #[test]
     #[ignore = "requires root, and changes routes in a network namespace of its own"]
     fn add_get_delete_round_trip_through_the_main_table() {
-        let mut handle = isolated();
-        let lo = crate::if_nametoindex("lo").unwrap();
-        let route = Route::new(IpAddr::V4(Ipv4Addr::new(198, 18, 255, 0)), 24).ifindex(lo);
+        isolated(|mut handle| {
+            let lo = crate::if_nametoindex("lo").unwrap();
+            let route = Route::new(IpAddr::V4(Ipv4Addr::new(198, 18, 255, 0)), 24).ifindex(lo);
 
-        handle.add_route(&route).unwrap();
-        assert_eq!(
-            handle.add_route(&route).unwrap_err().raw_os_error(),
-            Some(libc::EEXIST)
-        );
-        assert_eq!(
-            handle
-                .get_route(&Route::new(IpAddr::V4(Ipv4Addr::new(198, 18, 255, 7)), 32))
-                .unwrap(),
-            Route::new(IpAddr::V4(Ipv4Addr::new(198, 18, 255, 7)), 32).ifindex(lo)
-        );
-        handle.delete_route(&route).unwrap();
-        assert_eq!(
-            handle.delete_route(&route).unwrap_err().kind(),
-            io::ErrorKind::NotFound
-        );
+            handle.add_route(&route).unwrap();
+            assert_eq!(
+                handle.add_route(&route).unwrap_err().raw_os_error(),
+                Some(libc::EEXIST)
+            );
+            assert_eq!(
+                handle
+                    .get_route(&Route::new(IpAddr::V4(Ipv4Addr::new(198, 18, 255, 7)), 32))
+                    .unwrap(),
+                Route::new(IpAddr::V4(Ipv4Addr::new(198, 18, 255, 7)), 32).ifindex(lo)
+            );
+            handle.delete_route(&route).unwrap();
+            assert_eq!(
+                handle.delete_route(&route).unwrap_err().kind(),
+                io::ErrorKind::NotFound
+            );
+        });
     }
 
     #[test]
     #[ignore = "requires root, and changes routes in a network namespace of its own"]
     fn monitor_reports_added_and_deleted_routes_of_every_table() {
-        let mut handle = isolated();
-        let mut monitor = RouteMonitor::new().unwrap();
-        let lo = crate::if_nametoindex("lo").unwrap();
-        let route = Route::new(IpAddr::V4(Ipv4Addr::new(198, 18, 254, 0)), 24).ifindex(lo);
-        let throw = Route::new(route.destination, 24)
-            .kind(RouteKind::Throw)
-            .table(LIVE_TABLE);
+        isolated(|mut handle| {
+            let mut monitor = RouteMonitor::new().unwrap();
+            let lo = crate::if_nametoindex("lo").unwrap();
+            let route = Route::new(IpAddr::V4(Ipv4Addr::new(198, 18, 254, 0)), 24).ifindex(lo);
+            let throw = Route::new(route.destination, 24)
+                .kind(RouteKind::Throw)
+                .table(LIVE_TABLE);
 
-        handle.add_route(&route).unwrap();
-        handle.add_route(&throw).unwrap();
-        handle.delete_route(&route).unwrap();
-        handle.delete_route(&throw).unwrap();
+            handle.add_route(&route).unwrap();
+            handle.add_route(&throw).unwrap();
+            handle.delete_route(&route).unwrap();
+            handle.delete_route(&throw).unwrap();
 
-        let mut next = || loop {
-            let change = monitor.recv().unwrap();
-            if change.1.destination == route.destination {
-                return change;
-            }
-        };
-        assert_eq!(next(), (RouteChange::Add, route));
-        assert_eq!(next(), (RouteChange::Add, throw));
-        assert_eq!(next(), (RouteChange::Delete, route));
-        assert_eq!(next(), (RouteChange::Delete, throw));
+            let mut next = || loop {
+                let change = monitor.recv().unwrap();
+                if change.1.destination == route.destination {
+                    return change;
+                }
+            };
+            assert_eq!(next(), (RouteChange::Add, route));
+            assert_eq!(next(), (RouteChange::Add, throw));
+            assert_eq!(next(), (RouteChange::Delete, route));
+            assert_eq!(next(), (RouteChange::Delete, throw));
+        });
     }
 
     /// Tables and rule priorities no system uses, for the live tests; a
@@ -1545,42 +1575,43 @@ mod tests {
     #[test]
     #[ignore = "requires root, and changes routes in a network namespace of its own"]
     fn routes_of_every_kind_round_trip_through_a_table() {
-        let mut handle = isolated();
-        let lo = crate::if_nametoindex("lo").unwrap();
-        let host = |last| Route::new(IpAddr::V4(Ipv4Addr::new(198, 18, 253, last)), 32);
+        isolated(|mut handle| {
+            let lo = crate::if_nametoindex("lo").unwrap();
+            let host = |last| Route::new(IpAddr::V4(Ipv4Addr::new(198, 18, 253, last)), 32);
 
-        for table in [LIVE_SMALL_TABLE, LIVE_TABLE] {
-            let routes = [
-                Route::default().ifindex(lo),
-                host(1).ifindex(lo),
-                host(2).kind(RouteKind::Local).ifindex(lo),
-                host(3).kind(RouteKind::Blackhole),
-                host(4).kind(RouteKind::Unreachable),
-                host(5).kind(RouteKind::Prohibit),
-                host(6).kind(RouteKind::Throw),
-            ]
-            .map(|route| route.table(table));
+            for table in [LIVE_SMALL_TABLE, LIVE_TABLE] {
+                let routes = [
+                    Route::default().ifindex(lo),
+                    host(1).ifindex(lo),
+                    host(2).kind(RouteKind::Local).ifindex(lo),
+                    host(3).kind(RouteKind::Blackhole),
+                    host(4).kind(RouteKind::Unreachable),
+                    host(5).kind(RouteKind::Prohibit),
+                    host(6).kind(RouteKind::Throw),
+                ]
+                .map(|route| route.table(table));
 
-            for route in &routes {
-                handle
-                    .add_route(route)
-                    .unwrap_or_else(|error| panic!("add {route:?}: {error}"));
-                assert_eq!(
-                    handle.add_route(route).unwrap_err().kind(),
-                    io::ErrorKind::AlreadyExists,
-                    "{route:?}"
-                );
-                if route.destination.is_unspecified() {
-                    let default = handle.get_route(&Route::default().table(table));
-                    assert_eq!(default.unwrap(), *route);
+                for route in &routes {
+                    handle
+                        .add_route(route)
+                        .unwrap_or_else(|error| panic!("add {route:?}: {error}"));
+                    assert_eq!(
+                        handle.add_route(route).unwrap_err().kind(),
+                        io::ErrorKind::AlreadyExists,
+                        "{route:?}"
+                    );
+                    if route.destination.is_unspecified() {
+                        let default = handle.get_route(&Route::default().table(table));
+                        assert_eq!(default.unwrap(), *route);
+                    }
+                    handle.delete_route(route).unwrap();
+                    assert_eq!(
+                        handle.delete_route(route).unwrap_err().kind(),
+                        io::ErrorKind::NotFound
+                    );
                 }
-                handle.delete_route(route).unwrap();
-                assert_eq!(
-                    handle.delete_route(route).unwrap_err().kind(),
-                    io::ErrorKind::NotFound
-                );
             }
-        }
+        });
     }
 
     /// Adds `rule`, adds it again, deletes it and deletes it again.
@@ -1603,55 +1634,56 @@ mod tests {
     #[test]
     #[ignore = "requires root, and changes rules in a network namespace of its own"]
     fn rules_of_both_families_round_trip_by_their_spec() {
-        let mut handle = isolated();
-        let lookup = RuleAction::Lookup(LIVE_RULE_TABLE);
-        let benchmarking = IpAddr::V4(Ipv4Addr::new(198, 18, 0, 0));
+        isolated(|mut handle| {
+            let lookup = RuleAction::Lookup(LIVE_RULE_TABLE);
+            let benchmarking = IpAddr::V4(Ipv4Addr::new(198, 18, 0, 0));
 
-        let every_selector = Rule::v4()
-            .priority(LIVE_PRIORITY)
-            .from(benchmarking, 15)
-            .to(IpAddr::V4(Ipv4Addr::new(198, 19, 252, 0)), 24)
-            .fwmark(0x5100, 0xff00)
-            .iif("lo")
-            .oif("rtx-missing0")
-            .uid_range(4242..=4243)
-            .ip_proto(17)
-            .sport(1024..=2048)
-            .dport(53..=53)
-            .invert()
-            .action(lookup)
-            .suppress_prefixlength(0);
-        let ipv6 = Rule::v6()
-            .priority(LIVE_PRIORITY)
-            .fwmark(0x5100, u32::MAX)
-            .oif("lo")
-            .uid_range(4242..=4242)
-            .ip_proto(6)
-            .dport(443..=443)
-            .action(lookup)
-            .suppress_prefixlength(64);
-        let rules = [
-            every_selector,
-            ipv6,
-            Rule::v4().priority(LIVE_PRIORITY + 1).action(lookup),
-            Rule::v6().priority(LIVE_PRIORITY + 1).action(lookup),
-            Rule::v4()
-                .priority(LIVE_PRIORITY + 2)
-                .to(benchmarking, 15)
-                .action(RuleAction::Blackhole),
-            Rule::v6()
-                .priority(LIVE_PRIORITY + 2)
+            let every_selector = Rule::v4()
+                .priority(LIVE_PRIORITY)
+                .from(benchmarking, 15)
+                .to(IpAddr::V4(Ipv4Addr::new(198, 19, 252, 0)), 24)
+                .fwmark(0x5100, 0xff00)
+                .iif("lo")
+                .oif("rtx-missing0")
+                .uid_range(4242..=4243)
+                .ip_proto(17)
+                .sport(1024..=2048)
+                .dport(53..=53)
+                .invert()
+                .action(lookup)
+                .suppress_prefixlength(0);
+            let ipv6 = Rule::v6()
+                .priority(LIVE_PRIORITY)
                 .fwmark(0x5100, u32::MAX)
-                .action(RuleAction::Unreachable),
-            Rule::v4()
-                .priority(LIVE_PRIORITY + 3)
-                .to(benchmarking, 15)
-                .action(RuleAction::Prohibit),
-        ];
+                .oif("lo")
+                .uid_range(4242..=4242)
+                .ip_proto(6)
+                .dport(443..=443)
+                .action(lookup)
+                .suppress_prefixlength(64);
+            let rules = [
+                every_selector,
+                ipv6,
+                Rule::v4().priority(LIVE_PRIORITY + 1).action(lookup),
+                Rule::v6().priority(LIVE_PRIORITY + 1).action(lookup),
+                Rule::v4()
+                    .priority(LIVE_PRIORITY + 2)
+                    .to(benchmarking, 15)
+                    .action(RuleAction::Blackhole),
+                Rule::v6()
+                    .priority(LIVE_PRIORITY + 2)
+                    .fwmark(0x5100, u32::MAX)
+                    .action(RuleAction::Unreachable),
+                Rule::v4()
+                    .priority(LIVE_PRIORITY + 3)
+                    .to(benchmarking, 15)
+                    .action(RuleAction::Prohibit),
+            ];
 
-        for rule in &rules {
-            round_trip(&mut handle, rule);
-        }
+            for rule in &rules {
+                round_trip(&mut handle, rule);
+            }
+        });
     }
 
     /// The rules of a tunnel that captures what is not marked as its own,
@@ -1660,75 +1692,77 @@ mod tests {
     #[test]
     #[ignore = "requires root, and changes rules in a network namespace of its own"]
     fn tunnel_capture_rules_round_trip_by_their_spec() {
-        let mut handle = isolated();
-        let tunnel = RuleAction::Lookup(LIVE_RULE_TABLE);
+        isolated(|mut handle| {
+            let tunnel = RuleAction::Lookup(LIVE_RULE_TABLE);
 
-        for rule in [Rule::v4(), Rule::v6()] {
-            let suppress = rule
-                .clone()
-                .priority(LIVE_PRIORITY + 10)
-                .suppress_prefixlength(0);
-            let unmarked = rule
-                .clone()
-                .priority(LIVE_PRIORITY + 11)
-                .invert()
-                .fwmark(0x5100, u32::MAX)
-                .action(tunnel);
-            let every = rule.priority(LIVE_PRIORITY + 12).action(tunnel);
+            for rule in [Rule::v4(), Rule::v6()] {
+                let suppress = rule
+                    .clone()
+                    .priority(LIVE_PRIORITY + 10)
+                    .suppress_prefixlength(0);
+                let unmarked = rule
+                    .clone()
+                    .priority(LIVE_PRIORITY + 11)
+                    .invert()
+                    .fwmark(0x5100, u32::MAX)
+                    .action(tunnel);
+                let every = rule.priority(LIVE_PRIORITY + 12).action(tunnel);
 
-            for rule in [&suppress, &unmarked, &every] {
-                handle.add_rule(rule).unwrap();
+                for rule in [&suppress, &unmarked, &every] {
+                    handle.add_rule(rule).unwrap();
+                }
+                for rule in [&suppress, &unmarked, &every] {
+                    handle.delete_rule(rule).unwrap();
+                }
+                assert_eq!(
+                    handle.delete_rule(&unmarked).unwrap_err().kind(),
+                    io::ErrorKind::NotFound
+                );
             }
-            for rule in [&suppress, &unmarked, &every] {
-                handle.delete_rule(rule).unwrap();
-            }
-            assert_eq!(
-                handle.delete_rule(&unmarked).unwrap_err().kind(),
-                io::ErrorKind::NotFound
-            );
-        }
+        });
     }
 
     #[test]
     #[ignore = "requires root, and changes routes and rules in a network namespace of its own"]
     fn rules_choose_the_table_a_lookup_goes_through() {
-        let mut handle = isolated();
-        let lo = crate::if_nametoindex("lo").unwrap();
-        let prefix = IpAddr::V4(Ipv4Addr::new(198, 18, 252, 0));
-        let destination = |last| Route::new(IpAddr::V4(Ipv4Addr::new(198, 18, 252, last)), 32);
-        let rule = Rule::v4()
-            .priority(LIVE_PRIORITY + 20)
-            .to(prefix, 24)
-            .action(RuleAction::Lookup(LIVE_TABLE));
+        isolated(|mut handle| {
+            let lo = crate::if_nametoindex("lo").unwrap();
+            let prefix = IpAddr::V4(Ipv4Addr::new(198, 18, 252, 0));
+            let destination = |last| Route::new(IpAddr::V4(Ipv4Addr::new(198, 18, 252, last)), 32);
+            let rule = Rule::v4()
+                .priority(LIVE_PRIORITY + 20)
+                .to(prefix, 24)
+                .action(RuleAction::Lookup(LIVE_TABLE));
 
-        // The namespace starts with no route out of the host.
-        handle.add_route(&Route::default().ifindex(lo)).unwrap();
-        let main = destination(1).ifindex(lo);
-        assert_eq!(handle.get_route(&destination(1)).unwrap(), main);
+            // The namespace starts with no route out of the host.
+            handle.add_route(&Route::default().ifindex(lo)).unwrap();
+            let main = destination(1).ifindex(lo);
+            assert_eq!(handle.get_route(&destination(1)).unwrap(), main);
 
-        handle
-            .add_route(&Route::new(prefix, 24).ifindex(lo).table(LIVE_TABLE))
-            .unwrap();
-        handle
-            .add_route(
-                &Route::new(IpAddr::V4(Ipv4Addr::new(198, 18, 252, 128)), 25)
-                    .kind(RouteKind::Throw)
-                    .table(LIVE_TABLE),
-            )
-            .unwrap();
-        handle.add_rule(&rule).unwrap();
-        assert_eq!(
-            handle.get_route(&destination(1)).unwrap(),
-            main.table(LIVE_TABLE)
-        );
-        // A throw, and a route the rule suppresses, leave the packet to the
-        // rules after: to the main table.
-        assert_eq!(
-            handle.get_route(&destination(129)).unwrap(),
-            destination(129).ifindex(lo)
-        );
-        handle.delete_rule(&rule).unwrap();
-        handle.add_rule(&rule.suppress_prefixlength(24)).unwrap();
-        assert_eq!(handle.get_route(&destination(1)).unwrap(), main);
+            handle
+                .add_route(&Route::new(prefix, 24).ifindex(lo).table(LIVE_TABLE))
+                .unwrap();
+            handle
+                .add_route(
+                    &Route::new(IpAddr::V4(Ipv4Addr::new(198, 18, 252, 128)), 25)
+                        .kind(RouteKind::Throw)
+                        .table(LIVE_TABLE),
+                )
+                .unwrap();
+            handle.add_rule(&rule).unwrap();
+            assert_eq!(
+                handle.get_route(&destination(1)).unwrap(),
+                main.table(LIVE_TABLE)
+            );
+            // A throw, and a route the rule suppresses, leave the packet to the
+            // rules after: to the main table.
+            assert_eq!(
+                handle.get_route(&destination(129)).unwrap(),
+                destination(129).ifindex(lo)
+            );
+            handle.delete_rule(&rule).unwrap();
+            handle.add_rule(&rule.suppress_prefixlength(24)).unwrap();
+            assert_eq!(handle.get_route(&destination(1)).unwrap(), main);
+        });
     }
 }
