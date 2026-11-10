@@ -101,14 +101,17 @@ impl Handle {
 
     /// Makes `address` an address of its interface, whether or not it is
     /// one already. An interface has an `ip` once, so this changes the
-    /// prefix and peer of the one that is there. An IPv6 address is deleted
-    /// and added again for it, unless it is there as asked.
+    /// prefix and peer of an IPv4 address that is there. The kernel changes
+    /// neither of an IPv6 address: this fails with `AlreadyExists`, and
+    /// changes nothing, when the address is there with another, and a
+    /// caller deletes it first.
     ///
     /// A peer takes a point-to-point interface, such as a `utun`. There, an
     /// IPv4 address without a peer is the first IPv4 address of the
-    /// interface or none, and brings no route: this fails with
-    /// `InvalidInput`, and changes nothing, where it would take the place of
-    /// another address, or keep the peer the address has.
+    /// interface or none, and brings no route. This changes nothing where
+    /// it would take the place of another address, and fails with
+    /// `InvalidInput`, or where the address is there with a peer, which the
+    /// kernel would leave it, and fails with `AlreadyExists`.
     pub fn replace_address(&mut self, address: &Address) -> io::Result<()> {
         address.validate()?;
 

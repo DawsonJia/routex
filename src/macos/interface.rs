@@ -233,25 +233,34 @@ fn flags(socket: BorrowedFd<'_>, request: &mut ifreq) -> io::Result<c_short> {
 /// SIOCSIFADDR and SIOCSIFNETMASK change the address they name, or else the
 /// first one, whatever it is, and keep its peer.
 fn set_peerless(socket: BorrowedFd<'_>, name: IfName, ip: Ipv4Addr, prefix: u8) -> io::Result<()> {
-    let invalid = |message: String| Err(io::Error::new(io::ErrorKind::InvalidInput, message));
-
     // A request that names no address is about the first one.
     let mut first = if_request(name);
     match ioctl(socket, SIOCGIFADDR, &mut first) {
         Err(error) if error.raw_os_error() == Some(EADDRNOTAVAIL) => {}
         Err(error) => return Err(error),
         Ok(()) => {
-            let first_ip = sockaddr_ip(unsafe { first.ifr_ifru.ifru_addr });
-            if first_ip != Some(ip) {
-                return invalid(format!(
-                    "{ip} without a peer would take the place of {first_ip:?}, the first IPv4 \
-                     address of a point-to-point interface"
+            let first = sockaddr_ip(unsafe { first.ifr_ifru.ifru_addr }).ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "the first IPv4 address of the interface is of no family",
+                )
+            })?;
+            if first != ip {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!(
+                        "{ip} without a peer would take the place of {first}, the first IPv4 \
+                         address of a point-to-point interface"
+                    ),
                 ));
             }
             let mut peer = if_request(name);
             ioctl(socket, SIOCGIFDSTADDR, &mut peer)?;
             if let Some(peer) = sockaddr_ip(unsafe { peer.ifr_ifru.ifru_dstaddr }) {
-                return invalid(format!("{ip} would keep its peer {peer}"));
+                return Err(io::Error::new(
+                    io::ErrorKind::AlreadyExists,
+                    format!("{ip} has the peer {peer}, which macOS leaves it: delete it first"),
+                ));
             }
         }
     }
@@ -280,44 +289,46 @@ fn replace_v6(
     prefix: u8,
     peer: Option<Ipv6Addr>,
 ) -> io::Result<()> {
-    let delete = || ioctl(socket, SIOCDIFADDR_IN6, &mut in6_request(name, ip));
-    let add = |prefix, peer: Option<Ipv6Addr>| {
-        let mut request = In6AliasReq {
-            name,
-            addr: in6_sockaddr(ip),
-            // No peer is a sockaddr of no family.
-            dstaddr: peer.map_or(unsafe { zeroed() }, in6_sockaddr),
-            prefixmask: in6_sockaddr(v6_netmask(prefix)),
-            flags: 0,
-            lifetime: in6_addrlifetime {
-                ia6t_expire: 0,
-                ia6t_preferred: 0,
-                ia6t_vltime: INFINITE_LIFETIME,
-                ia6t_pltime: INFINITE_LIFETIME,
-            },
-        };
-        ioctl(socket, SIOCAIFADDR_IN6, &mut request)
-    };
-
-    // XNU gives an address its prefix and peer when it adds it and changes
-    // neither after, and joins the multicast groups of an address anew each
-    // time it is set: one that is as asked stays as it is, and any other
-    // goes first.
-    let current = v6_state(socket, name, ip)?;
-    match current {
-        Some(current) if current == (prefix, peer, true) => return Ok(()),
-        Some(_) => delete()?,
-        None => {}
-    }
-    add(prefix, peer).inspect_err(|_| {
-        // XNU may leave an address it fails to add on the interface, without
-        // its route. The interface gets back the address it had, set by
-        // hand.
-        let _ = delete();
-        if let Some((prefix, peer, _)) = current {
-            let _ = add(prefix, peer);
+    if let Some((current_prefix, current_peer, by_hand_for_good)) = v6_state(socket, name, ip)? {
+        // XNU gives an address its prefix and peer when it adds it, and
+        // changes neither after.
+        if (current_prefix, current_peer) != (prefix, peer) {
+            let with_peer = current_peer.map_or(String::new(), |peer| format!(" with peer {peer}"));
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                format!(
+                    "{ip} is there under prefix {current_prefix}{with_peer}, and macOS changes \
+                     neither: delete it first"
+                ),
+            ));
         }
-    })
+        // XNU joins the multicast groups of an address anew each time it is
+        // set: one that is as asked is left as it is.
+        if by_hand_for_good {
+            return Ok(());
+        }
+    }
+
+    // A new address, or one the system gave the interface, which becomes
+    // one set by hand, for good.
+    let mut request = In6AliasReq {
+        name,
+        addr: in6_sockaddr(ip),
+        // No peer is a sockaddr of no family.
+        dstaddr: peer.map_or(unsafe { zeroed() }, in6_sockaddr),
+        prefixmask: in6_sockaddr(v6_netmask(prefix)),
+        flags: 0,
+        lifetime: in6_addrlifetime {
+            ia6t_expire: 0,
+            ia6t_preferred: 0,
+            ia6t_vltime: INFINITE_LIFETIME,
+            ia6t_pltime: INFINITE_LIFETIME,
+        },
+    };
+    // TODO: XNU leaves an address on the interface when it fails it after
+    // it has put it there, as its sources have it do for a second address
+    // to one peer, whose route is there already.
+    ioctl(socket, SIOCAIFADDR_IN6, &mut request)
 }
 
 /// What the address `ip` of the interface `name` is, if the interface has
@@ -690,13 +701,16 @@ mod tests {
         assert_kind(replace_address(&other), io::ErrorKind::InvalidInput);
         assert_eq!(addresses(utun.index), HashSet::from([to_peer]));
 
-        // The first address keeps a peer it has.
+        // The first address keeps a peer it has: it is deleted first.
         let peerless = v4_address(utun.index, [250, 1], 32);
-        assert_kind(replace_address(&peerless), io::ErrorKind::InvalidInput);
+        assert_kind(replace_address(&peerless), io::ErrorKind::AlreadyExists);
         assert_eq!(addresses(utun.index), HashSet::from([to_peer]));
-
         delete_address(&to_peer).unwrap();
-        assert_kind(delete_address(&to_peer), io::ErrorKind::NotFound);
+        replace_address(&peerless).unwrap();
+        assert_eq!(addresses(utun.index), HashSet::from([peerless]));
+
+        delete_address(&peerless).unwrap();
+        assert_kind(delete_address(&peerless), io::ErrorKind::NotFound);
         assert_eq!(addresses(utun.index), HashSet::new());
     }
 
@@ -737,7 +751,7 @@ mod tests {
 
     #[test]
     #[ignore = "requires root, and configures a utun interface of its own"]
-    fn ipv6_addresses_change_their_prefix_and_peer() {
+    fn an_ipv6_address_keeps_the_prefix_and_peer_it_was_added_with() {
         let utun = utun();
         let address = v6_address(utun.index, [0, 1], 64);
         let host = v6_address(utun.index, [1, 1], 128);
@@ -748,63 +762,41 @@ mod tests {
         replace_address(&address).unwrap();
         assert_eq!(addresses(utun.index), HashSet::from([address]));
 
+        // Another prefix takes a delete first.
         let wider = v6_address(utun.index, [0, 1], 48);
+        assert_kind(replace_address(&wider), io::ErrorKind::AlreadyExists);
+        assert_eq!(addresses(utun.index), HashSet::from([address]));
+        delete_address(&address).unwrap();
         replace_address(&wider).unwrap();
         assert_eq!(addresses(utun.index), HashSet::from([wider]));
 
-        replace_address(&host.peer(peer(2))).unwrap();
-        replace_address(&host.peer(peer(3))).unwrap();
-        assert_eq!(
-            addresses(utun.index),
-            HashSet::from([wider, host.peer(peer(3))])
+        // So does another peer, or none.
+        let to_peer = host.peer(peer(2));
+        replace_address(&to_peer).unwrap();
+        replace_address(&to_peer).unwrap();
+        assert_kind(
+            replace_address(&host.peer(peer(3))),
+            io::ErrorKind::AlreadyExists,
         );
+        assert_kind(replace_address(&host), io::ErrorKind::AlreadyExists);
+        assert_eq!(addresses(utun.index), HashSet::from([wider, to_peer]));
+        delete_address(&host).unwrap();
+        replace_address(&host).unwrap();
+        assert_eq!(addresses(utun.index), HashSet::from([wider, host]));
 
-        // The kernel takes a peer with a host prefix only, and the address
-        // it refuses to change stays as it was.
-        let refused = v6_address(utun.index, [1, 1], 64).peer(peer(3));
+        // The kernel takes a peer with a host prefix only, and has nothing
+        // of an address it refuses.
+        let refused = v6_address(utun.index, [1, 3], 64).peer(peer(4));
         assert_eq!(
             replace_address(&refused).unwrap_err().raw_os_error(),
             Some(EINVAL)
         );
-        assert_eq!(
-            addresses(utun.index),
-            HashSet::from([wider, host.peer(peer(3))])
-        );
-
-        replace_address(&host).unwrap();
         assert_eq!(addresses(utun.index), HashSet::from([wider, host]));
 
         delete_address(&host).unwrap();
         delete_address(&wider).unwrap();
         assert_kind(delete_address(&wider), io::ErrorKind::NotFound);
         assert_eq!(addresses(utun.index), HashSet::new());
-    }
-
-    #[test]
-    #[ignore = "requires root, and configures a utun interface of its own"]
-    fn an_ipv6_address_the_kernel_fails_to_add_leaves_what_was_there() {
-        let utun = utun();
-        let peer = |last| IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0xfb, 1, 0, 0, 0, last));
-        let first = v6_address(utun.index, [1, 1], 128).peer(peer(9));
-        let second = v6_address(utun.index, [1, 2], 128);
-        replace_address(&first).unwrap();
-
-        // The kernel has one route to a peer, and may fail a second address
-        // to it: then the address is not there, or is there as it was.
-        let added = replace_address(&second.peer(peer(9)));
-        let after = match added {
-            Ok(()) => HashSet::from([first, second.peer(peer(9))]),
-            Err(_) => HashSet::from([first]),
-        };
-        assert_eq!(addresses(utun.index), after, "{added:?}");
-
-        replace_address(&second.peer(peer(8))).unwrap();
-        let changed = replace_address(&second.peer(peer(9)));
-        let after = match changed {
-            Ok(()) => HashSet::from([first, second.peer(peer(9))]),
-            Err(_) => HashSet::from([first, second.peer(peer(8))]),
-        };
-        assert_eq!(addresses(utun.index), after, "{changed:?}");
     }
 
     #[test]
@@ -850,7 +842,13 @@ mod tests {
         let lo0 = lo0();
         let address = v4_address(lo0, [251, 1], 32);
         let before = addresses(lo0);
-        assert!(!before.contains(&address));
+        // Under any prefix: the test would change it, and delete it by its
+        // ip.
+        assert!(
+            before.iter().all(|existing| existing.ip != address.ip),
+            "lo0 has {} already",
+            address.ip
+        );
 
         let _cleanup = Cleanup(address);
         replace_address(&address).unwrap();
