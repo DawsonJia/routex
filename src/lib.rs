@@ -36,6 +36,8 @@ fn missing_route(error: io::Error) -> io::Error {
 mod linux;
 #[cfg(target_os = "macos")]
 mod macos;
+#[cfg(target_os = "linux")]
+mod rule;
 #[cfg(target_os = "windows")]
 mod windows;
 
@@ -43,6 +45,8 @@ mod windows;
 pub use linux::{Handle, RouteMonitor};
 #[cfg(target_os = "macos")]
 pub use macos::{Handle, RouteMonitor};
+#[cfg(target_os = "linux")]
+pub use rule::{Rule, RuleAction};
 #[cfg(target_os = "windows")]
 pub use windows::{Handle, if_friendly_name_to_index};
 

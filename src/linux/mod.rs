@@ -22,13 +22,16 @@ use netlink_packet_route::{
     },
 };
 
-use crate::{Route, RouteChange, RouteKind, fd, missing_route};
+use crate::{Route, RouteChange, RouteKind, Rule, fd, missing_route};
+
+mod rule;
 
 /// Holds any datagram: the kernel sizes a dump datagram to the larger of
 /// 8 KiB and the reader's buffer.
 const RECV_BUF_LEN: usize = 16384;
 
-/// A netlink socket that changes and queries the routing tables.
+/// A netlink socket that changes and queries the routing tables, and
+/// changes the rules that choose between them.
 pub struct Handle {
     fd: OwnedFd,
     port_id: u32,
@@ -118,6 +121,33 @@ impl Handle {
                 payload => Err(unexpected_reply(payload)),
             })
         })
+    }
+
+    /// Adds `rule`; fails with `AlreadyExists` if a rule with its
+    /// priority, selectors and action is there, whether or not it inverts
+    /// them.
+    pub fn add_rule(&mut self, rule: &Rule) -> io::Result<()> {
+        rule.validate()?;
+
+        let sequence = self.request(
+            NLM_F_EXCL | NLM_F_CREATE | NLM_F_ACK,
+            RouteNetlinkMessage::NewRule(rule::rule_message(rule)),
+        )?;
+        self.replies(sequence, |message| Some(ack(message.payload)))
+    }
+
+    /// Deletes the first rule, by priority, with the action of `rule` and
+    /// every selector that `rule` sets, and its priority if set; fails with
+    /// `NotFound` if there is none. The kernel matches a rule that inverts
+    /// its selectors whether or not `rule` does.
+    pub fn delete_rule(&mut self, rule: &Rule) -> io::Result<()> {
+        rule.validate()?;
+
+        let sequence = self.request(
+            NLM_F_ACK,
+            RouteNetlinkMessage::DelRule(rule::rule_message(rule)),
+        )?;
+        self.replies(sequence, |message| Some(ack(message.payload)))
     }
 
     fn default_route(&mut self, route: &Route) -> io::Result<Route> {
@@ -676,7 +706,7 @@ mod tests {
     use netlink_packet_route::route::{RouteNextHop, RouteVia};
 
     use super::*;
-    use crate::{TABLE_LOCAL, TABLE_MAIN};
+    use crate::{RuleAction, TABLE_LOCAL, TABLE_MAIN};
 
     fn message(
         sequence: u32,
@@ -797,6 +827,91 @@ mod tests {
             "the dump was left unread"
         );
         route
+    }
+
+    /// The request that `call` makes of a fake kernel that acks it with
+    /// `error`, and what `call` returns.
+    fn ack_from_fake_kernel(
+        call: impl FnOnce(&mut Handle) -> io::Result<()>,
+        error: Option<i32>,
+    ) -> (NetlinkMessage<RouteNetlinkMessage>, io::Result<()>) {
+        let (client, kernel) = UnixDatagram::pair().unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let kernel = std::thread::spawn(move || {
+            let mut buf = [0; RECV_BUF_LEN];
+            let n = kernel.recv(&mut buf).unwrap();
+            let request = parse_nlmsgs(&buf[..n]).unwrap().remove(0);
+            let header = request.header;
+            let reply = ack_message(header.sequence_number, header.port_number, error);
+            kernel.send(&serialize(&[reply])).unwrap();
+            request
+        });
+
+        let mut handle = Handle {
+            fd: client.into(),
+            port_id: 42,
+            sequence: 0,
+        };
+        let result = call(&mut handle);
+        (kernel.join().unwrap(), result)
+    }
+
+    #[test]
+    fn a_rule_is_added_exclusively_and_deleted_by_its_spec() {
+        let rule = Rule::v4().priority(5200).suppress_prefixlength(0);
+
+        let (request, added) = ack_from_fake_kernel(|handle| handle.add_rule(&rule), None);
+        added.unwrap();
+        assert_eq!(
+            request.header.flags,
+            NLM_F_REQUEST | NLM_F_ACK | NLM_F_CREATE | NLM_F_EXCL
+        );
+        assert_eq!(
+            request.payload,
+            NetlinkPayload::InnerMessage(RouteNetlinkMessage::NewRule(rule::rule_message(&rule)))
+        );
+
+        let (request, deleted) = ack_from_fake_kernel(|handle| handle.delete_rule(&rule), None);
+        deleted.unwrap();
+        assert_eq!(request.header.flags, NLM_F_REQUEST | NLM_F_ACK);
+        assert_eq!(
+            request.payload,
+            NetlinkPayload::InnerMessage(RouteNetlinkMessage::DelRule(rule::rule_message(&rule)))
+        );
+    }
+
+    #[test]
+    fn deleting_a_missing_rule_or_route_is_not_found() {
+        let rule = Rule::v6().priority(5210).action(RuleAction::Lookup(51888));
+        let route = Route::default().kind(RouteKind::Throw).table(51888);
+
+        let (_, rule) =
+            ack_from_fake_kernel(|handle| handle.delete_rule(&rule), Some(-libc::ENOENT));
+        let (_, route) =
+            ack_from_fake_kernel(|handle| handle.delete_route(&route), Some(-libc::ESRCH));
+        let (_, duplicate) =
+            ack_from_fake_kernel(|handle| handle.add_rule(&Rule::v4()), Some(-libc::EEXIST));
+
+        assert_eq!(rule.unwrap_err().kind(), io::ErrorKind::NotFound);
+        assert_eq!(route.unwrap_err().kind(), io::ErrorKind::NotFound);
+        assert_eq!(duplicate.unwrap_err().kind(), io::ErrorKind::AlreadyExists);
+    }
+
+    #[test]
+    fn an_invalid_rule_is_not_sent() {
+        let mut handle = Handle {
+            fd: UnixDatagram::pair().unwrap().0.into(),
+            port_id: 42,
+            sequence: 0,
+        };
+
+        let error = handle.add_rule(&Rule::v4().ip_proto(0)).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        let error = handle.delete_rule(&Rule::v4().iif("")).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        assert_eq!(handle.sequence, 0);
     }
 
     fn default_route(gateway: Ipv4Addr, ifindex: u32, metric: Option<u32>) -> RouteMessage {
@@ -1443,5 +1558,177 @@ mod tests {
                 assert_eq!(missing.unwrap_err().kind(), io::ErrorKind::NotFound);
             }
         }
+    }
+
+    /// Priorities and tables no system uses, for the live rule tests. The
+    /// rules of each test look up their own table, so that a rule that
+    /// selects every packet never routes it by another test's routes.
+    const LIVE_PRIORITY: u32 = 31_980;
+    const LIVE_RULE_TABLE: u32 = 3_198_019;
+    const LIVE_POLICY_TABLE: u32 = 3_198_020;
+
+    /// What adding `rule`, adding it again, deleting it and deleting it
+    /// again come to, asserted after the rule is gone.
+    fn round_trip(handle: &mut Handle, rule: &Rule) {
+        let added = handle.add_rule(rule);
+        let duplicate = handle.add_rule(rule);
+        let deleted = handle.delete_rule(rule);
+        let missing = handle.delete_rule(rule);
+
+        added.unwrap_or_else(|error| panic!("add {rule:?}: {error}"));
+        assert_eq!(
+            duplicate.unwrap_err().kind(),
+            io::ErrorKind::AlreadyExists,
+            "{rule:?}"
+        );
+        deleted.unwrap();
+        assert_eq!(missing.unwrap_err().kind(), io::ErrorKind::NotFound);
+    }
+
+    #[test]
+    #[ignore = "requires CAP_NET_ADMIN and temporarily installs rules of an unused priority"]
+    fn rules_of_both_families_round_trip_by_their_spec() {
+        let mut handle = Handle::new().unwrap();
+        let lookup = RuleAction::Lookup(LIVE_RULE_TABLE);
+        let benchmarking = IpAddr::V4(Ipv4Addr::new(198, 18, 0, 0));
+        // Apart from the destinations of the other live tests.
+        let dropped = IpAddr::V4(Ipv4Addr::new(198, 19, 255, 0));
+
+        let every_selector = Rule::v4()
+            .priority(LIVE_PRIORITY)
+            .from(benchmarking, 15)
+            .to(IpAddr::V4(Ipv4Addr::new(198, 19, 252, 0)), 24)
+            .fwmark(0x5100, 0xff00)
+            .iif("lo")
+            .oif("rtx-missing0")
+            .uid_range(4242..=4243)
+            .ip_proto(17)
+            .sport(1024..=2048)
+            .dport(53..=53)
+            .invert()
+            .action(lookup)
+            .suppress_prefixlength(0);
+        let ipv6 = Rule::v6()
+            .priority(LIVE_PRIORITY)
+            .fwmark(0x5100, u32::MAX)
+            .oif("lo")
+            .uid_range(4242..=4242)
+            .ip_proto(6)
+            .dport(443..=443)
+            .action(lookup)
+            .suppress_prefixlength(64);
+        let rules = [
+            every_selector,
+            ipv6,
+            Rule::v4().priority(LIVE_PRIORITY + 1).action(lookup),
+            Rule::v6().priority(LIVE_PRIORITY + 1).action(lookup),
+            Rule::v4()
+                .priority(LIVE_PRIORITY + 2)
+                .to(dropped, 24)
+                .action(RuleAction::Blackhole),
+            Rule::v6()
+                .priority(LIVE_PRIORITY + 2)
+                .fwmark(0x5100, u32::MAX)
+                .action(RuleAction::Unreachable),
+            Rule::v4()
+                .priority(LIVE_PRIORITY + 3)
+                .to(dropped, 24)
+                .action(RuleAction::Prohibit),
+        ];
+
+        for rule in &rules {
+            round_trip(&mut handle, rule);
+        }
+    }
+
+    /// The rules of a tunnel that captures what is not marked as its own,
+    /// or what is not bound to another interface, and leaves the main
+    /// table's more specific routes alone.
+    #[test]
+    #[ignore = "requires CAP_NET_ADMIN and temporarily installs rules of an unused priority"]
+    fn tunnel_capture_rules_round_trip_by_their_spec() {
+        let mut handle = Handle::new().unwrap();
+        let tunnel = RuleAction::Lookup(LIVE_RULE_TABLE);
+
+        for rule in [Rule::v4(), Rule::v6()] {
+            let suppress = rule
+                .clone()
+                .priority(LIVE_PRIORITY + 10)
+                .suppress_prefixlength(0);
+            let unmarked = rule
+                .clone()
+                .priority(LIVE_PRIORITY + 11)
+                .invert()
+                .fwmark(0x5100, u32::MAX)
+                .action(tunnel);
+            let every = rule.priority(LIVE_PRIORITY + 12).action(tunnel);
+
+            let added: Vec<_> = [&suppress, &unmarked, &every]
+                .map(|rule| handle.add_rule(rule))
+                .into();
+            let deleted: Vec<_> = [&suppress, &unmarked, &every]
+                .map(|rule| handle.delete_rule(rule))
+                .into();
+            let missing = handle.delete_rule(&unmarked);
+
+            for result in added.into_iter().chain(deleted) {
+                result.unwrap();
+            }
+            assert_eq!(missing.unwrap_err().kind(), io::ErrorKind::NotFound);
+        }
+    }
+
+    #[test]
+    #[ignore = "requires CAP_NET_ADMIN and temporarily installs reserved test routes and rules"]
+    fn rules_choose_the_table_a_lookup_goes_through() {
+        let lo = crate::if_nametoindex("lo").unwrap();
+        let prefix = IpAddr::V4(Ipv4Addr::new(198, 18, 252, 0));
+        let destination = |last| Route::new(IpAddr::V4(Ipv4Addr::new(198, 18, 252, last)), 32);
+        let route = Route::new(prefix, 24).ifindex(lo).table(LIVE_POLICY_TABLE);
+        let throw = Route::new(IpAddr::V4(Ipv4Addr::new(198, 18, 252, 128)), 25)
+            .kind(RouteKind::Throw)
+            .table(LIVE_POLICY_TABLE);
+        let rule = Rule::v4()
+            .priority(LIVE_PRIORITY + 20)
+            .to(prefix, 24)
+            .action(RuleAction::Lookup(LIVE_POLICY_TABLE));
+        let suppress = rule.clone().suppress_prefixlength(24);
+        let mut handle = Handle::new().unwrap();
+
+        let unruled = handle.get_route(&destination(1));
+        let setup = [
+            handle.add_route(&route),
+            handle.add_route(&throw),
+            handle.add_rule(&rule),
+        ];
+        let ruled = handle.get_route(&destination(1));
+        let thrown = handle.get_route(&destination(129));
+        let swap = [handle.delete_rule(&rule), handle.add_rule(&suppress)];
+        let suppressed = handle.get_route(&destination(1));
+        let cleanup = [
+            handle.delete_rule(&suppress),
+            handle.delete_route(&throw),
+            handle.delete_route(&route),
+        ];
+
+        for result in setup.into_iter().chain(swap).chain(cleanup) {
+            result.unwrap();
+        }
+        let main = unruled.unwrap();
+        assert_eq!(main.table, TABLE_MAIN);
+        assert_eq!(
+            ruled.unwrap(),
+            destination(1).ifindex(lo).table(LIVE_POLICY_TABLE)
+        );
+        // A throw, and a route the rule suppresses, leave the packet to the
+        // rules after: to the main table.
+        assert_eq!(
+            thrown.unwrap(),
+            Route {
+                destination: destination(129).destination,
+                ..main
+            }
+        );
+        assert_eq!(suppressed.unwrap(), main);
     }
 }
