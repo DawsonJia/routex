@@ -22,7 +22,7 @@ use netlink_packet_route::{
     },
 };
 
-use crate::{Route, RouteChange, fd};
+use crate::{Route, RouteChange, fd, missing_route};
 
 /// Holds any datagram: the kernel sizes a dump datagram to the larger of
 /// 8 KiB and the reader's buffer.
@@ -82,7 +82,8 @@ impl Handle {
     }
 
     /// Deletes the main-table route to `route.destination/prefix`, through
-    /// the gateway and interface of `route` where they are set.
+    /// the gateway and interface of `route` where they are set; fails with
+    /// `NotFound` if there is none.
     pub fn delete_route(&mut self, route: &Route) -> io::Result<()> {
         route.validate()?;
 
@@ -91,6 +92,7 @@ impl Handle {
 
         let sequence = self.request(NLM_F_ACK, RouteNetlinkMessage::DelRoute(rt_msg))?;
         self.replies(sequence, |message| Some(ack(message.payload)))
+            .map_err(missing_route)
     }
 
     /// How the kernel routes `route.destination`, out of `route.ifindex` if
@@ -1168,8 +1170,8 @@ mod tests {
             Route::new(IpAddr::V4(Ipv4Addr::new(198, 18, 255, 7)), 32).ifindex(lo)
         );
         assert_eq!(
-            handle.delete_route(&route).unwrap_err().raw_os_error(),
-            Some(libc::ESRCH)
+            handle.delete_route(&route).unwrap_err().kind(),
+            io::ErrorKind::NotFound
         );
     }
 

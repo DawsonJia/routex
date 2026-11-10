@@ -52,6 +52,8 @@ settings.
 - On Linux, `add_route`, `delete_route` and `RouteMonitor` work on the main table only. The
   monitor reports every route of it, blackholes included; a multipath route
   without its gateways and interfaces.
+- `add_route` of a route that is there fails with `io::ErrorKind::AlreadyExists`,
+  and `delete_route` of one that is not with `io::ErrorKind::NotFound`.
 - On macOS, `Route::ifscope` installs an interface-scoped route
   (`RTF_IFSCOPE`), which only lookups bound to that interface match: the way to
   keep a per-interface default route next to a VPN's.

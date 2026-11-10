@@ -14,7 +14,7 @@ use libc::{
     RTM_DELETE, RTM_GET, SHUT_RD, SOCK_RAW,
 };
 
-use crate::{Route, RouteChange, fd};
+use crate::{Route, RouteChange, fd, missing_route};
 use rtmsg::{MESSAGE_CAPACITY, Message, Writer, message_type};
 
 /// `RTF_IFSCOPE` is the XNU flag that ties a route to a specific interface
@@ -69,7 +69,8 @@ impl Handle {
     }
 
     /// Deletes the route to `route.destination/prefix`, in the scope of
-    /// `route.scope_ifindex` if it is set.
+    /// `route.scope_ifindex` if it is set; fails with `NotFound` if there is
+    /// none.
     pub fn delete_route(&mut self, route: &Route) -> io::Result<()> {
         route.validate()?;
 
@@ -77,6 +78,7 @@ impl Handle {
             self.fd.as_fd(),
             &request(route, RTM_DELETE, next_sequence()),
         )
+        .map_err(missing_route)
     }
 
     /// The table entry the kernel routes `route.destination` by, in the scope
@@ -534,7 +536,7 @@ mod tests {
 
     #[test]
     #[ignore = "requires root and temporarily installs a reserved test route"]
-    fn mutation_write_reports_duplicate_and_missing_route_errors_without_echo() {
+    fn mutation_write_reports_duplicate_and_missing_routes_without_echo() {
         let route = Route::new(IpAddr::V4(Ipv4Addr::new(198, 18, 255, 254)), 32)
             .ifindex(crate::if_nametoindex("lo0").unwrap());
         let mut handle = Handle::new().unwrap();
@@ -546,8 +548,8 @@ mod tests {
         cleanup.unwrap();
         assert_eq!(duplicate.unwrap_err().raw_os_error(), Some(libc::EEXIST));
         assert_eq!(
-            handle.delete_route(&route).unwrap_err().raw_os_error(),
-            Some(libc::ESRCH)
+            handle.delete_route(&route).unwrap_err().kind(),
+            io::ErrorKind::NotFound
         );
     }
 

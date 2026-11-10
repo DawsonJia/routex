@@ -20,6 +20,18 @@ macro_rules! syscall {
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 mod fd;
+
+/// Linux and macOS fail to delete a route that is not there with `ESRCH`,
+/// which is `NotFound` here, as on Windows, with the kernel's error as its
+/// source.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn missing_route(error: io::Error) -> io::Error {
+    if error.raw_os_error() == Some(libc::ESRCH) {
+        io::Error::new(io::ErrorKind::NotFound, error)
+    } else {
+        error
+    }
+}
 #[cfg(target_os = "linux")]
 mod linux;
 #[cfg(target_os = "macos")]
@@ -151,6 +163,18 @@ pub fn if_nametoindex(name: &str) -> Option<u32> {
 mod tests {
     use super::*;
     use std::net::{Ipv4Addr, Ipv6Addr};
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn a_missing_route_is_not_found_with_the_kernel_error_as_its_source() {
+        let error = missing_route(io::Error::from_raw_os_error(libc::ESRCH));
+        assert_eq!(error.kind(), io::ErrorKind::NotFound);
+        let source = error.get_ref().unwrap().downcast_ref::<io::Error>();
+        assert_eq!(source.unwrap().raw_os_error(), Some(libc::ESRCH));
+
+        let other = missing_route(io::Error::from_raw_os_error(libc::EPERM));
+        assert_eq!(other.raw_os_error(), Some(libc::EPERM));
+    }
 
     #[test]
     fn validate_rejects_prefix_outside_address_family() {
