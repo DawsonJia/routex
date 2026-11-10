@@ -10,7 +10,8 @@ use windows_sys::Win32::{
         SetUnicastIpAddressEntry,
     },
     Networking::WinSock::{
-        AF_INET, AF_INET6, IpDadStatePreferred, IpPrefixOriginManual, IpSuffixOriginManual,
+        ADDRESS_FAMILY, AF_INET, AF_INET6, IpDadStatePreferred, IpPrefixOriginManual,
+        IpSuffixOriginManual,
     },
 };
 
@@ -21,25 +22,32 @@ use crate::Address;
 const INFINITE_LIFETIME: u32 = u32::MAX;
 
 pub(super) fn replace_address(address: &Address) -> io::Result<()> {
-    let mut row = address_row(address);
-    match win32_result(unsafe { GetUnicastIpAddressEntry(&mut row) }) {
-        // The interface has the ip, as an adapter that is opened again has
-        // the addresses of its last use: the row takes the new prefix, and
-        // keeps the rest of what the system has for it.
-        Ok(()) => {
-            set_manual(&mut row, address.prefix);
-            win32_result(unsafe { SetUnicastIpAddressEntry(&row) })
+    loop {
+        let mut row = address_row(address);
+        match win32_result(unsafe { GetUnicastIpAddressEntry(&mut row) }) {
+            // The interface has the ip, as an adapter that is opened again
+            // has the addresses of its last use: the row takes the new
+            // prefix, and keeps the rest of what the system has for it.
+            Ok(()) => {
+                set_manual(&mut row, address.prefix);
+                return win32_result(unsafe { SetUnicastIpAddressEntry(&row) });
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                let mut row = address_row(address);
+                set_manual(&mut row, address.prefix);
+                // In use at once, while the system looks for a duplicate.
+                // TODO: an address that turns out to be a duplicate is
+                // reported nowhere.
+                row.DadState = IpDadStatePreferred;
+                match win32_result(unsafe { CreateUnicastIpAddressEntry(&row) }) {
+                    // Another caller added the ip in between: the row that
+                    // is there now takes the prefix of this one.
+                    Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+                    result => return result,
+                }
+            }
+            Err(error) => return Err(error),
         }
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {
-            let mut row = address_row(address);
-            set_manual(&mut row, address.prefix);
-            // In use at once, while the system looks for a duplicate.
-            // TODO: an address that turns out to be a duplicate is reported
-            // nowhere.
-            row.DadState = IpDadStatePreferred;
-            win32_result(unsafe { CreateUnicastIpAddressEntry(&row) })
-        }
-        Err(error) => Err(error),
     }
 }
 
@@ -48,11 +56,17 @@ pub(super) fn delete_address(address: &Address) -> io::Result<()> {
 }
 
 pub(super) fn set_mtu(ifindex: u32, mtu: u32) -> io::Result<()> {
-    for mut row in interface_rows(ifindex)? {
+    // IPv6 takes no MTU under 1280, and IPv4 every one that IPv6 takes: the
+    // row of IPv6 goes first, so that an MTU it refuses changes neither.
+    let rows = [
+        interface_row(ifindex, AF_INET6)?,
+        interface_row(ifindex, AF_INET)?,
+    ];
+    if rows.iter().all(Option::is_none) {
+        return Err(no_interface(ifindex));
+    }
+    for mut row in rows.into_iter().flatten() {
         row.NlMtu = mtu;
-        // GetIpInterfaceEntry may fill in a SitePrefixLength that
-        // SetIpInterfaceEntry refuses.
-        row.SitePrefixLength = 0;
         win32_result(unsafe { SetIpInterfaceEntry(&mut row) })?;
     }
 
@@ -60,7 +74,13 @@ pub(super) fn set_mtu(ifindex: u32, mtu: u32) -> io::Result<()> {
 }
 
 pub(super) fn get_mtu(ifindex: u32) -> io::Result<u32> {
-    Ok(interface_rows(ifindex)?[0].NlMtu)
+    for family in [AF_INET, AF_INET6] {
+        if let Some(row) = interface_row(ifindex, family)? {
+            return Ok(row.NlMtu);
+        }
+    }
+
+    Err(no_interface(ifindex))
 }
 
 /// The row that selects `address.ip` on its interface.
@@ -84,29 +104,40 @@ fn set_manual(row: &mut MIB_UNICASTIPADDRESS_ROW, prefix: u8) {
     row.SkipAsSource = false;
 }
 
-/// The rows of the interface `ifindex`, one for each of IPv4 and IPv6 that
-/// it has, IPv4 first; fails with `NotFound` if it has neither.
-fn interface_rows(ifindex: u32) -> io::Result<Vec<MIB_IPINTERFACE_ROW>> {
-    let mut rows = Vec::new();
-    for family in [AF_INET, AF_INET6] {
-        let mut row = MIB_IPINTERFACE_ROW::default();
-        unsafe { InitializeIpInterfaceEntry(&mut row) };
-        row.Family = family;
-        row.InterfaceIndex = ifindex;
-        match win32_result(unsafe { GetIpInterfaceEntry(&mut row) }) {
-            Ok(()) => rows.push(row),
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-            Err(error) => return Err(error),
-        }
+/// The row of the interface `ifindex` for `family`, as SetIpInterfaceEntry
+/// takes it back, or none if the interface has no such family.
+fn interface_row(ifindex: u32, family: ADDRESS_FAMILY) -> io::Result<Option<MIB_IPINTERFACE_ROW>> {
+    let mut row = MIB_IPINTERFACE_ROW::default();
+    unsafe { InitializeIpInterfaceEntry(&mut row) };
+    row.Family = family;
+    row.InterfaceIndex = ifindex;
+    match win32_result(unsafe { GetIpInterfaceEntry(&mut row) }) {
+        Ok(()) => {}
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
     }
+    row.SitePrefixLength = site_prefix_length(family, row.SitePrefixLength);
 
-    if rows.is_empty() {
-        return Err(io::Error::new(
-            io::ErrorKind::NotFound,
-            format!("no interface {ifindex} with IPv4 or IPv6"),
-        ));
+    Ok(Some(row))
+}
+
+/// The SitePrefixLength to set a row of `family` with, given the one that
+/// GetIpInterfaceEntry `reported`, which SetIpInterfaceEntry may refuse: it
+/// takes 0 alone for IPv4, and for IPv6 no more than the bits of an address.
+/// The length of an IPv6 interface is otherwise its own, and stays.
+fn site_prefix_length(family: ADDRESS_FAMILY, reported: u32) -> u32 {
+    if family == AF_INET {
+        0
+    } else {
+        reported.min(128)
     }
-    Ok(rows)
+}
+
+fn no_interface(ifindex: u32) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::NotFound,
+        format!("no interface {ifindex} with IPv4 or IPv6"),
+    )
 }
 
 #[cfg(test)]
@@ -146,6 +177,14 @@ mod tests {
         assert_eq!(row.PreferredLifetime, INFINITE_LIFETIME);
         assert!(!row.SkipAsSource);
         assert_eq!(row.DadState, IpDadStateTentative);
+    }
+
+    #[test]
+    fn a_row_is_set_with_a_site_prefix_length_its_family_takes() {
+        assert_eq!(site_prefix_length(AF_INET, 255), 0);
+        assert_eq!(site_prefix_length(AF_INET, 24), 0);
+        assert_eq!(site_prefix_length(AF_INET6, 64), 64);
+        assert_eq!(site_prefix_length(AF_INET6, 255), 128);
     }
 
     #[test]

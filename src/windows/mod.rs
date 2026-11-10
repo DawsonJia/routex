@@ -90,7 +90,8 @@ impl Handle {
     }
 
     /// Sets the MTU of the interface `ifindex`, for each of IPv4 and IPv6
-    /// that the interface has.
+    /// that the interface has. An MTU that IPv6 refuses, as it does one
+    /// under 1280, changes that of neither.
     pub fn set_link_mtu(&mut self, ifindex: u32, mtu: u32) -> io::Result<()> {
         interface::set_mtu(ifindex, mtu)
     }
