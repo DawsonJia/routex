@@ -24,15 +24,41 @@ mod fd;
 mod linux;
 #[cfg(target_os = "macos")]
 mod macos;
+#[cfg(target_os = "linux")]
+mod rule;
 #[cfg(target_os = "windows")]
 mod windows;
 
 #[cfg(target_os = "linux")]
-pub use linux::{RouteMonitor, RouteSock};
+pub use linux::{Handle, RouteMonitor};
 #[cfg(target_os = "macos")]
-pub use macos::{RouteMonitor, RouteSock};
+pub use macos::{Handle, RouteMonitor};
+#[cfg(target_os = "linux")]
+pub use rule::{Rule, RuleAction};
 #[cfg(target_os = "windows")]
-pub use windows::{RouteSock, if_friendly_name_to_index};
+pub use windows::{Handle, if_friendly_name_to_index};
+
+/// The table of the routes to the host's own addresses (`local`).
+#[cfg(target_os = "linux")]
+pub const TABLE_LOCAL: u32 = 255;
+/// The table routes are in unless they name another (`main`).
+#[cfg(target_os = "linux")]
+pub const TABLE_MAIN: u32 = 254;
+/// The table the last of the kernel's own rules looks up (`default`).
+#[cfg(target_os = "linux")]
+pub const TABLE_DEFAULT: u32 = 253;
+
+/// Linux and macOS fail to delete a route that is not there with `ESRCH`,
+/// which is `NotFound` here, as on Windows, with the kernel's error as its
+/// source.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn missing_route(error: io::Error) -> io::Error {
+    if error.raw_os_error() == Some(libc::ESRCH) {
+        io::Error::new(io::ErrorKind::NotFound, error)
+    } else {
+        error
+    }
+}
 
 /// A route: traffic to `destination/prefix` goes through `gateway`, or
 /// straight out of interface `ifindex`.
@@ -45,6 +71,13 @@ pub struct Route {
     /// The outgoing interface. Without a gateway, the destination is on its
     /// link.
     pub ifindex: Option<u32>,
+    /// What the route does with the traffic it matches.
+    #[cfg(target_os = "linux")]
+    pub kind: RouteKind,
+    /// The table the route is in, [`TABLE_MAIN`] unless set. The rules
+    /// choose the tables a packet is routed by.
+    #[cfg(target_os = "linux")]
+    pub table: u32,
     /// macOS interface-scoped routing (`RTF_IFSCOPE`). When set, the route
     /// is only matched by lookups whose `IP_BOUND_IF` scope equals this
     /// ifindex. Used to install a per-interface copy of the default route so
@@ -68,6 +101,10 @@ impl Route {
             prefix,
             gateway: None,
             ifindex: None,
+            #[cfg(target_os = "linux")]
+            kind: RouteKind::Unicast,
+            #[cfg(target_os = "linux")]
+            table: TABLE_MAIN,
             #[cfg(target_os = "macos")]
             scope_ifindex: None,
         }
@@ -101,6 +138,24 @@ impl Route {
             ));
         }
 
+        #[cfg(target_os = "linux")]
+        {
+            // The kernel takes table 0 for the main one; a route names it.
+            if self.table == 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "table 0 is not a table",
+                ));
+            }
+
+            if !self.kind.has_next_hop() && (self.gateway.is_some() || self.ifindex.is_some()) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("a {:?} route has no gateway or interface", self.kind),
+                ));
+            }
+        }
+
         Ok(())
     }
 
@@ -114,11 +169,53 @@ impl Route {
         self
     }
 
+    #[cfg(target_os = "linux")]
+    pub fn kind(mut self, kind: RouteKind) -> Route {
+        self.kind = kind;
+        self
+    }
+
+    #[cfg(target_os = "linux")]
+    pub fn table(mut self, table: u32) -> Route {
+        self.table = table;
+        self
+    }
+
     /// Scope this route to a specific interface (`RTF_IFSCOPE`).
     #[cfg(target_os = "macos")]
     pub fn ifscope(mut self, ifindex: u32) -> Route {
         self.scope_ifindex = Some(ifindex);
         self
+    }
+}
+
+/// What a route does with the traffic it matches.
+#[cfg(target_os = "linux")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum RouteKind {
+    /// Sends it through the gateway, or out of the interface.
+    Unicast,
+    /// Delivers it to this host, as the routes to the host's own addresses
+    /// in [`TABLE_LOCAL`] do.
+    Local,
+    /// Drops it; a local sender gets `EINVAL`.
+    Blackhole,
+    /// Drops it with an ICMP host unreachable; a local sender gets
+    /// `EHOSTUNREACH`.
+    Unreachable,
+    /// Drops it with an ICMP administratively prohibited; a local sender
+    /// gets `EACCES`.
+    Prohibit,
+    /// Ends the lookup in this table, so the rules after the one that chose
+    /// it go on.
+    Throw,
+}
+
+#[cfg(target_os = "linux")]
+impl RouteKind {
+    /// Whether a route of this kind leaves through a gateway or interface.
+    pub(crate) fn has_next_hop(self) -> bool {
+        matches!(self, RouteKind::Unicast | RouteKind::Local)
     }
 }
 
@@ -151,6 +248,53 @@ pub fn if_nametoindex(name: &str) -> Option<u32> {
 mod tests {
     use super::*;
     use std::net::{Ipv4Addr, Ipv6Addr};
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn validate_rejects_table_zero() {
+        let route = Route::default().table(0);
+
+        assert_eq!(
+            route.validate().unwrap_err().kind(),
+            io::ErrorKind::InvalidInput
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn validate_rejects_a_next_hop_for_a_route_that_drops_or_throws() {
+        let gateway = IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1));
+        for kind in [
+            RouteKind::Blackhole,
+            RouteKind::Unreachable,
+            RouteKind::Prohibit,
+            RouteKind::Throw,
+        ] {
+            let route = Route::default().kind(kind);
+            assert!(route.validate().is_ok());
+            for route in [route.gateway(gateway), route.ifindex(1)] {
+                assert_eq!(
+                    route.validate().unwrap_err().kind(),
+                    io::ErrorKind::InvalidInput
+                );
+            }
+        }
+        for kind in [RouteKind::Unicast, RouteKind::Local] {
+            assert!(Route::default().kind(kind).ifindex(1).validate().is_ok());
+        }
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn a_missing_route_is_not_found_with_the_kernel_error_as_its_source() {
+        let error = missing_route(io::Error::from_raw_os_error(libc::ESRCH));
+        assert_eq!(error.kind(), io::ErrorKind::NotFound);
+        let source = error.get_ref().unwrap().downcast_ref::<io::Error>();
+        assert_eq!(source.unwrap().raw_os_error(), Some(libc::ESRCH));
+
+        let other = missing_route(io::Error::from_raw_os_error(libc::EPERM));
+        assert_eq!(other.raw_os_error(), Some(libc::EPERM));
+    }
 
     #[test]
     fn validate_rejects_prefix_outside_address_family() {
