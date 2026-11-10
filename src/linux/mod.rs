@@ -703,7 +703,10 @@ mod tests {
     };
 
     use netlink_packet_core::{DefaultNla, DoneMessage, NLM_F_MULTIPART};
-    use netlink_packet_route::route::{RouteNextHop, RouteVia};
+    use netlink_packet_route::{
+        link::{LinkFlags, LinkMessage},
+        route::{RouteNextHop, RouteVia},
+    };
 
     use super::*;
     use crate::{RuleAction, TABLE_LOCAL, TABLE_MAIN};
@@ -1458,25 +1461,46 @@ mod tests {
         assert_ne!(route.ifindex, crate::if_nametoindex("lo"));
     }
 
+    /// A handle in a network namespace of the calling thread's own, with
+    /// `lo` up. libtest runs each test on a thread of its own, so a live test
+    /// that changes routes and rules there can neither touch the host's nor
+    /// leave its own behind: the namespace goes with the test.
+    fn isolated() -> Handle {
+        syscall!(unshare(libc::CLONE_NEWNET)).unwrap();
+
+        let mut lo = LinkMessage::default();
+        lo.header.index = crate::if_nametoindex("lo").unwrap();
+        lo.header.flags = LinkFlags::Up;
+        lo.header.change_mask = LinkFlags::Up;
+        let mut handle = Handle::new().unwrap();
+        let sequence = handle
+            .request(NLM_F_ACK, RouteNetlinkMessage::SetLink(lo))
+            .unwrap();
+        handle
+            .replies(sequence, |message| Some(ack(message.payload)))
+            .unwrap();
+        handle
+    }
+
     #[test]
-    #[ignore = "requires CAP_NET_ADMIN and temporarily installs a reserved test route"]
+    #[ignore = "requires root, and changes routes in a network namespace of its own"]
     fn add_get_delete_round_trip_through_the_main_table() {
+        let mut handle = isolated();
         let lo = crate::if_nametoindex("lo").unwrap();
         let route = Route::new(IpAddr::V4(Ipv4Addr::new(198, 18, 255, 0)), 24).ifindex(lo);
-        let mut handle = Handle::new().unwrap();
 
         handle.add_route(&route).unwrap();
-        let duplicate = handle.add_route(&route);
-        let found = handle.get_route(&Route::new(IpAddr::V4(Ipv4Addr::new(198, 18, 255, 7)), 32));
-        let cleanup = handle.delete_route(&route);
-
-        cleanup.unwrap();
-        assert_eq!(duplicate.unwrap_err().raw_os_error(), Some(libc::EEXIST));
-        let found = found.unwrap();
         assert_eq!(
-            found,
+            handle.add_route(&route).unwrap_err().raw_os_error(),
+            Some(libc::EEXIST)
+        );
+        assert_eq!(
+            handle
+                .get_route(&Route::new(IpAddr::V4(Ipv4Addr::new(198, 18, 255, 7)), 32))
+                .unwrap(),
             Route::new(IpAddr::V4(Ipv4Addr::new(198, 18, 255, 7)), 32).ifindex(lo)
         );
+        handle.delete_route(&route).unwrap();
         assert_eq!(
             handle.delete_route(&route).unwrap_err().kind(),
             io::ErrorKind::NotFound
@@ -1484,15 +1508,15 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "requires CAP_NET_ADMIN and temporarily installs a reserved test route"]
+    #[ignore = "requires root, and changes routes in a network namespace of its own"]
     fn monitor_reports_added_and_deleted_routes_of_every_table() {
+        let mut handle = isolated();
+        let mut monitor = RouteMonitor::new().unwrap();
         let lo = crate::if_nametoindex("lo").unwrap();
         let route = Route::new(IpAddr::V4(Ipv4Addr::new(198, 18, 254, 0)), 24).ifindex(lo);
         let throw = Route::new(route.destination, 24)
             .kind(RouteKind::Throw)
             .table(LIVE_TABLE);
-        let mut monitor = RouteMonitor::new().unwrap();
-        let mut handle = Handle::new().unwrap();
 
         handle.add_route(&route).unwrap();
         handle.add_route(&throw).unwrap();
@@ -1511,17 +1535,19 @@ mod tests {
         assert_eq!(next(), (RouteChange::Delete, throw));
     }
 
-    /// Tables no system uses, one that fits in the header and one that does
-    /// not, for the live tests.
-    const LIVE_TABLE: u32 = 3_198_018;
+    /// Tables and rule priorities no system uses, for the live tests; a
+    /// table that fits in the header and two that do not.
     const LIVE_SMALL_TABLE: u32 = 218;
+    const LIVE_TABLE: u32 = 3_198_018;
+    const LIVE_RULE_TABLE: u32 = 3_198_019;
+    const LIVE_PRIORITY: u32 = 31_980;
 
     #[test]
-    #[ignore = "requires CAP_NET_ADMIN and temporarily installs reserved test routes"]
+    #[ignore = "requires root, and changes routes in a network namespace of its own"]
     fn routes_of_every_kind_round_trip_through_a_table() {
+        let mut handle = isolated();
         let lo = crate::if_nametoindex("lo").unwrap();
         let host = |last| Route::new(IpAddr::V4(Ipv4Addr::new(198, 18, 253, last)), 32);
-        let mut handle = Handle::new().unwrap();
 
         for table in [LIVE_SMALL_TABLE, LIVE_TABLE] {
             let routes = [
@@ -1536,63 +1562,50 @@ mod tests {
             .map(|route| route.table(table));
 
             for route in &routes {
-                let added = handle.add_route(route);
-                let duplicate = handle.add_route(route);
-                let default = route
-                    .destination
-                    .is_unspecified()
-                    .then(|| handle.get_route(&Route::default().table(table)));
-                let deleted = handle.delete_route(route);
-                let missing = handle.delete_route(route);
-
-                added.unwrap_or_else(|error| panic!("add {route:?}: {error}"));
+                handle
+                    .add_route(route)
+                    .unwrap_or_else(|error| panic!("add {route:?}: {error}"));
                 assert_eq!(
-                    duplicate.unwrap_err().kind(),
+                    handle.add_route(route).unwrap_err().kind(),
                     io::ErrorKind::AlreadyExists,
                     "{route:?}"
                 );
-                if let Some(default) = default {
+                if route.destination.is_unspecified() {
+                    let default = handle.get_route(&Route::default().table(table));
                     assert_eq!(default.unwrap(), *route);
                 }
-                deleted.unwrap();
-                assert_eq!(missing.unwrap_err().kind(), io::ErrorKind::NotFound);
+                handle.delete_route(route).unwrap();
+                assert_eq!(
+                    handle.delete_route(route).unwrap_err().kind(),
+                    io::ErrorKind::NotFound
+                );
             }
         }
     }
 
-    /// Priorities and tables no system uses, for the live rule tests. The
-    /// rules of each test look up their own table, so that a rule that
-    /// selects every packet never routes it by another test's routes.
-    const LIVE_PRIORITY: u32 = 31_980;
-    const LIVE_RULE_TABLE: u32 = 3_198_019;
-    const LIVE_POLICY_TABLE: u32 = 3_198_020;
-
-    /// What adding `rule`, adding it again, deleting it and deleting it
-    /// again come to, asserted after the rule is gone.
+    /// Adds `rule`, adds it again, deletes it and deletes it again.
     fn round_trip(handle: &mut Handle, rule: &Rule) {
-        let added = handle.add_rule(rule);
-        let duplicate = handle.add_rule(rule);
-        let deleted = handle.delete_rule(rule);
-        let missing = handle.delete_rule(rule);
-
-        added.unwrap_or_else(|error| panic!("add {rule:?}: {error}"));
+        handle
+            .add_rule(rule)
+            .unwrap_or_else(|error| panic!("add {rule:?}: {error}"));
         assert_eq!(
-            duplicate.unwrap_err().kind(),
+            handle.add_rule(rule).unwrap_err().kind(),
             io::ErrorKind::AlreadyExists,
             "{rule:?}"
         );
-        deleted.unwrap();
-        assert_eq!(missing.unwrap_err().kind(), io::ErrorKind::NotFound);
+        handle.delete_rule(rule).unwrap();
+        assert_eq!(
+            handle.delete_rule(rule).unwrap_err().kind(),
+            io::ErrorKind::NotFound
+        );
     }
 
     #[test]
-    #[ignore = "requires CAP_NET_ADMIN and temporarily installs rules of an unused priority"]
+    #[ignore = "requires root, and changes rules in a network namespace of its own"]
     fn rules_of_both_families_round_trip_by_their_spec() {
-        let mut handle = Handle::new().unwrap();
+        let mut handle = isolated();
         let lookup = RuleAction::Lookup(LIVE_RULE_TABLE);
         let benchmarking = IpAddr::V4(Ipv4Addr::new(198, 18, 0, 0));
-        // Apart from the destinations of the other live tests.
-        let dropped = IpAddr::V4(Ipv4Addr::new(198, 19, 255, 0));
 
         let every_selector = Rule::v4()
             .priority(LIVE_PRIORITY)
@@ -1624,7 +1637,7 @@ mod tests {
             Rule::v6().priority(LIVE_PRIORITY + 1).action(lookup),
             Rule::v4()
                 .priority(LIVE_PRIORITY + 2)
-                .to(dropped, 24)
+                .to(benchmarking, 15)
                 .action(RuleAction::Blackhole),
             Rule::v6()
                 .priority(LIVE_PRIORITY + 2)
@@ -1632,7 +1645,7 @@ mod tests {
                 .action(RuleAction::Unreachable),
             Rule::v4()
                 .priority(LIVE_PRIORITY + 3)
-                .to(dropped, 24)
+                .to(benchmarking, 15)
                 .action(RuleAction::Prohibit),
         ];
 
@@ -1645,9 +1658,9 @@ mod tests {
     /// or what is not bound to another interface, and leaves the main
     /// table's more specific routes alone.
     #[test]
-    #[ignore = "requires CAP_NET_ADMIN and temporarily installs rules of an unused priority"]
+    #[ignore = "requires root, and changes rules in a network namespace of its own"]
     fn tunnel_capture_rules_round_trip_by_their_spec() {
-        let mut handle = Handle::new().unwrap();
+        let mut handle = isolated();
         let tunnel = RuleAction::Lookup(LIVE_RULE_TABLE);
 
         for rule in [Rule::v4(), Rule::v6()] {
@@ -1663,72 +1676,59 @@ mod tests {
                 .action(tunnel);
             let every = rule.priority(LIVE_PRIORITY + 12).action(tunnel);
 
-            let added: Vec<_> = [&suppress, &unmarked, &every]
-                .map(|rule| handle.add_rule(rule))
-                .into();
-            let deleted: Vec<_> = [&suppress, &unmarked, &every]
-                .map(|rule| handle.delete_rule(rule))
-                .into();
-            let missing = handle.delete_rule(&unmarked);
-
-            for result in added.into_iter().chain(deleted) {
-                result.unwrap();
+            for rule in [&suppress, &unmarked, &every] {
+                handle.add_rule(rule).unwrap();
             }
-            assert_eq!(missing.unwrap_err().kind(), io::ErrorKind::NotFound);
+            for rule in [&suppress, &unmarked, &every] {
+                handle.delete_rule(rule).unwrap();
+            }
+            assert_eq!(
+                handle.delete_rule(&unmarked).unwrap_err().kind(),
+                io::ErrorKind::NotFound
+            );
         }
     }
 
     #[test]
-    #[ignore = "requires CAP_NET_ADMIN and temporarily installs reserved test routes and rules"]
+    #[ignore = "requires root, and changes routes and rules in a network namespace of its own"]
     fn rules_choose_the_table_a_lookup_goes_through() {
+        let mut handle = isolated();
         let lo = crate::if_nametoindex("lo").unwrap();
         let prefix = IpAddr::V4(Ipv4Addr::new(198, 18, 252, 0));
         let destination = |last| Route::new(IpAddr::V4(Ipv4Addr::new(198, 18, 252, last)), 32);
-        let route = Route::new(prefix, 24).ifindex(lo).table(LIVE_POLICY_TABLE);
-        let throw = Route::new(IpAddr::V4(Ipv4Addr::new(198, 18, 252, 128)), 25)
-            .kind(RouteKind::Throw)
-            .table(LIVE_POLICY_TABLE);
         let rule = Rule::v4()
             .priority(LIVE_PRIORITY + 20)
             .to(prefix, 24)
-            .action(RuleAction::Lookup(LIVE_POLICY_TABLE));
-        let suppress = rule.clone().suppress_prefixlength(24);
-        let mut handle = Handle::new().unwrap();
+            .action(RuleAction::Lookup(LIVE_TABLE));
 
-        let unruled = handle.get_route(&destination(1));
-        let setup = [
-            handle.add_route(&route),
-            handle.add_route(&throw),
-            handle.add_rule(&rule),
-        ];
-        let ruled = handle.get_route(&destination(1));
-        let thrown = handle.get_route(&destination(129));
-        let swap = [handle.delete_rule(&rule), handle.add_rule(&suppress)];
-        let suppressed = handle.get_route(&destination(1));
-        let cleanup = [
-            handle.delete_rule(&suppress),
-            handle.delete_route(&throw),
-            handle.delete_route(&route),
-        ];
+        // The namespace starts with no route out of the host.
+        handle.add_route(&Route::default().ifindex(lo)).unwrap();
+        let main = destination(1).ifindex(lo);
+        assert_eq!(handle.get_route(&destination(1)).unwrap(), main);
 
-        for result in setup.into_iter().chain(swap).chain(cleanup) {
-            result.unwrap();
-        }
-        let main = unruled.unwrap();
-        assert_eq!(main.table, TABLE_MAIN);
+        handle
+            .add_route(&Route::new(prefix, 24).ifindex(lo).table(LIVE_TABLE))
+            .unwrap();
+        handle
+            .add_route(
+                &Route::new(IpAddr::V4(Ipv4Addr::new(198, 18, 252, 128)), 25)
+                    .kind(RouteKind::Throw)
+                    .table(LIVE_TABLE),
+            )
+            .unwrap();
+        handle.add_rule(&rule).unwrap();
         assert_eq!(
-            ruled.unwrap(),
-            destination(1).ifindex(lo).table(LIVE_POLICY_TABLE)
+            handle.get_route(&destination(1)).unwrap(),
+            main.table(LIVE_TABLE)
         );
         // A throw, and a route the rule suppresses, leave the packet to the
         // rules after: to the main table.
         assert_eq!(
-            thrown.unwrap(),
-            Route {
-                destination: destination(129).destination,
-                ..main
-            }
+            handle.get_route(&destination(129)).unwrap(),
+            destination(129).ifindex(lo)
         );
-        assert_eq!(suppressed.unwrap(), main);
+        handle.delete_rule(&rule).unwrap();
+        handle.add_rule(&rule.suppress_prefixlength(24)).unwrap();
+        assert_eq!(handle.get_route(&destination(1)).unwrap(), main);
     }
 }

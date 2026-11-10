@@ -176,4 +176,6 @@ cargo run --example monitor
 `cargo test` runs the unit tests. `cargo test -- --ignored` also runs the
 checks against the live routing table; those that change routes and rules
 need root, use addresses from the reserved `198.18.0.0/15` benchmarking
-range, and tables and rule priorities no system uses.
+range, and tables and rule priorities no system uses. On Linux they run in a
+network namespace of their own, which leaves the host's routes and rules
+alone and goes with the test.
