@@ -195,17 +195,20 @@ fn main() {}
   fails on an address that is there: macOS has none to build it on. An
   address goes with its interface.
 - What is there already is the platform's to say. On macOS and Windows an
-  interface has an `ip` once: `replace_address` changes the prefix, and on
-  macOS the peer, of the one that is there, and `delete_address` deletes it
-  by its `ip` alone. macOS changes neither of an IPv6 address: one that is
-  there as asked is left as it is, and any other deleted and added again. On
-  Linux an IPv4 address is its `ip`, `prefix` and
-  `peer`: with another prefix or peer it is another address, which
-  `replace_address` adds beside the first, and each is deleted by its own.
-  On Linux an interface has an IPv6 `ip` once as well, but the kernel only
-  changes its peer: the prefix stays, with no error, and `delete_address`
-  takes the prefix that is there. A caller that changes the prefix of an
-  IPv6 address deletes it first.
+  interface has an `ip` once, and `delete_address` deletes it by its `ip`
+  alone. `replace_address` changes the prefix of the one that is there, and
+  on macOS the peer of an IPv4 one. On Linux an IPv4 address is its `ip`,
+  `prefix` and `peer`: with another prefix or peer it is another address,
+  which `replace_address` adds beside the first, and each is deleted by its
+  own.
+- On Linux and macOS an interface has an IPv6 `ip` once, and the kernel does
+  not change the prefix it was added with: a caller that changes the prefix,
+  or takes the peer away, deletes the address first. macOS says so:
+  `replace_address` of an IPv6 address that is there with another prefix or
+  peer fails with `io::ErrorKind::AlreadyExists`, and changes nothing. Linux
+  does not: it gives the address a new peer, and leaves the prefix, and the
+  peer of an address asked for without one, with no error; its
+  `delete_address` takes the prefix that is there.
 - An `Address::peer` is the other end of a point-to-point link; the address
   then brings a route to the peer, not to its prefix. Linux takes a peer on
   any interface. macOS takes one on a point-to-point interface, such as a
@@ -214,19 +217,25 @@ fn main() {}
   IPv4 address on a broadcast interface for the broadcast address.
 - On a point-to-point interface of macOS, an IPv4 address without a peer is
   the first IPv4 address of the interface or none: the kernel sets it over
-  the first one, whatever that is. `replace_address` asks the kernel for the
-  first address, and fails with `io::ErrorKind::InvalidInput`, changing
-  nothing, where the address would take the place of another, or keep the
-  peer the address has. A caller sets the address without a peer before
-  those with one; `routex` keeps no state of its own. Such an address brings
-  no route: a caller adds the one to its prefix.
+  the first one, whatever that is, and leaves it its peer. `replace_address`
+  asks the kernel for the first address, and changes nothing where the
+  address would take the place of another, which fails with
+  `io::ErrorKind::InvalidInput`, or is there with a peer, which fails with
+  `io::ErrorKind::AlreadyExists`. A caller sets the address without a peer
+  before those with one; `routex` keeps no state of its own. Such an address
+  brings no route: a caller adds the one to its prefix.
 - macOS has no prefix 0: an address with one fails with
   `io::ErrorKind::InvalidInput`, as the kernel would use the mask of the
   class of an IPv4 address instead.
 - `set_link_mtu` leaves the MTUs an interface does not take to the kernel to
   refuse. On Windows IPv4 and IPv6 each have an MTU of the interface:
-  `set_link_mtu` sets both, and `get_link_mtu` reads that of IPv4, or of IPv6
-  on an interface without IPv4.
+  `set_link_mtu` sets both, that of IPv6 first, so that an MTU under the
+  1280 that IPv6 takes changes neither, and `get_link_mtu` reads that of
+  IPv4, or of IPv6 on an interface without IPv4.
+- A change is one request to the kernel on Linux. On macOS and Windows most
+  take several, a question to the kernel and a request after its answer, so
+  two processes that change the same address or link at once may undo one
+  another's change.
 - An interface that is not there fails with the error of the platform:
   `ENODEV` on Linux, `ENXIO` on macOS, `io::ErrorKind::NotFound` on Windows.
 

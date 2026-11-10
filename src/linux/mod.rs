@@ -149,8 +149,9 @@ impl Handle {
     /// Makes `address` an address of its interface, whether or not it is
     /// one already. An IPv4 address is its `ip`, `prefix` and `peer`: with
     /// another prefix or peer it is another address, added beside the one
-    /// that is there. An interface has an IPv6 `ip` once: the kernel changes
-    /// the peer of the one that is there, and leaves its prefix as it is.
+    /// that is there. An interface has an IPv6 `ip` once: the kernel gives
+    /// the one that is there the peer of `address`, and leaves its prefix,
+    /// and its peer when `address` has none, as they are, with no error.
     pub fn replace_address(&mut self, address: &Address) -> io::Result<()> {
         address.validate()?;
 
@@ -2082,9 +2083,10 @@ mod tests {
             assert_eq!(addresses(&mut handle, dummy), HashSet::from([address]));
             assert_not_found(handle.delete_address(&Address::new(dummy, ip, 48)));
 
-            // It changes the peer of the one that is there.
+            // It gives the one that is there a peer, and takes none away.
             handle.replace_address(&host).unwrap();
             handle.replace_address(&host.peer(peer)).unwrap();
+            handle.replace_address(&host).unwrap();
             assert_eq!(
                 addresses(&mut handle, dummy),
                 HashSet::from([address, host.peer(peer)])
