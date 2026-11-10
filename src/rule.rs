@@ -39,13 +39,15 @@ pub struct Rule {
     /// Packets of a socket bound to the interface of this name
     /// (`SO_BINDTODEVICE`). The interface need not exist yet.
     pub oif: Option<String>,
-    /// Packets of a socket of a user in this range.
+    /// Packets of a socket of a user in this range; the kernel takes the
+    /// uids below `u32::MAX`.
     pub uid_range: Option<RangeInclusive<u32>>,
     /// Packets of this IP protocol, an `IPPROTO_*`.
     pub ip_proto: Option<u8>,
-    /// Packets from a port in this range.
+    /// Packets from a port in this range; the kernel takes the ports 1 to
+    /// 65534.
     pub sport: Option<RangeInclusive<u16>>,
-    /// Packets to a port in this range.
+    /// Packets to a port in this range, of the ports 1 to 65534.
     pub dport: Option<RangeInclusive<u16>>,
     /// Selects the packets the selectors above do not (`not`).
     pub invert: bool,
@@ -207,6 +209,19 @@ impl Rule {
             return invalid("IP protocol 0 selects every packet".into());
         }
 
+        // Only the bounds of a range go to the kernel, and those of one that
+        // was iterated to its end are not empty.
+        if let Some(uids) = &self.uid_range
+            && uids.is_empty()
+        {
+            return invalid(format!("empty uid_range {uids:?}"));
+        }
+        for ports in [&self.sport, &self.dport].into_iter().flatten() {
+            if ports.is_empty() {
+                return invalid(format!("empty port range {ports:?}"));
+            }
+        }
+
         for name in [&self.iif, &self.oif].into_iter().flatten() {
             if name.is_empty() || name.len() > MAX_IFNAME_LEN || name.contains('\0') {
                 return invalid(format!("invalid interface name {name:?}"));
@@ -268,6 +283,28 @@ mod tests {
         assert!(Rule::v4().ip_proto(17).validate().is_ok());
         assert_invalid(Rule::v4().fwmark(0x5100, 0));
         assert_invalid(Rule::v4().ip_proto(0));
+    }
+
+    #[test]
+    fn a_range_selects_some_value() {
+        let mut uids = 1000..=1000;
+        let mut ports = 53..=53;
+        assert!(
+            Rule::v4()
+                .uid_range(uids.clone())
+                .sport(ports.clone())
+                .dport(ports.clone())
+                .validate()
+                .is_ok()
+        );
+        uids.next();
+        ports.next();
+
+        assert_invalid(Rule::v4().uid_range(uids));
+        assert_invalid(Rule::v4().uid_range(RangeInclusive::new(5, 4)));
+        assert_invalid(Rule::v4().sport(ports.clone()));
+        assert_invalid(Rule::v4().dport(ports));
+        assert_invalid(Rule::v6().dport(RangeInclusive::new(100, 50)));
     }
 
     #[test]
