@@ -22,9 +22,12 @@ use windows_sys::Win32::{
     },
 };
 
-use crate::Route;
+use crate::{Address, Route};
 
-/// Changes and queries the routing table through the IP Helper API.
+mod interface;
+
+/// Changes and queries the routing table, and the addresses and MTU of the
+/// interfaces, through the IP Helper API.
 // TODO: a `RouteMonitor` backed by NotifyRouteChange2.
 pub struct Handle;
 
@@ -66,6 +69,36 @@ impl Handle {
         };
 
         route_from_row(&row)
+    }
+
+    /// Makes `address` an address of its interface, whether or not it is
+    /// one already. An interface has an `ip` once, so this changes the
+    /// prefix of the one that is there, which an adapter that is opened
+    /// again may have kept.
+    pub fn replace_address(&mut self, address: &Address) -> io::Result<()> {
+        address.validate()?;
+
+        interface::replace_address(address)
+    }
+
+    /// Deletes the address `address.ip` from its interface, whatever its
+    /// prefix; fails with `NotFound` if there is none.
+    pub fn delete_address(&mut self, address: &Address) -> io::Result<()> {
+        address.validate()?;
+
+        interface::delete_address(address)
+    }
+
+    /// Sets the MTU of the interface `ifindex`, for each of IPv4 and IPv6
+    /// that the interface has.
+    pub fn set_link_mtu(&mut self, ifindex: u32, mtu: u32) -> io::Result<()> {
+        interface::set_mtu(ifindex, mtu)
+    }
+
+    /// The MTU of the interface `ifindex`: that of IPv4, or of IPv6 on an
+    /// interface without IPv4.
+    pub fn get_link_mtu(&mut self, ifindex: u32) -> io::Result<u32> {
+        interface::get_mtu(ifindex)
     }
 }
 
