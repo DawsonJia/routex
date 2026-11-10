@@ -46,6 +46,16 @@ pub use macos::{Handle, RouteMonitor};
 #[cfg(target_os = "windows")]
 pub use windows::{Handle, if_friendly_name_to_index};
 
+/// The table of the routes to the host's own addresses (`local`).
+#[cfg(target_os = "linux")]
+pub const TABLE_LOCAL: u32 = 255;
+/// The table routes are in unless they name another (`main`).
+#[cfg(target_os = "linux")]
+pub const TABLE_MAIN: u32 = 254;
+/// The table the last of the kernel's own rules looks up (`default`).
+#[cfg(target_os = "linux")]
+pub const TABLE_DEFAULT: u32 = 253;
+
 /// A route: traffic to `destination/prefix` goes through `gateway`, or
 /// straight out of interface `ifindex`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -57,6 +67,13 @@ pub struct Route {
     /// The outgoing interface. Without a gateway, the destination is on its
     /// link.
     pub ifindex: Option<u32>,
+    /// What the route does with the traffic it matches.
+    #[cfg(target_os = "linux")]
+    pub kind: RouteKind,
+    /// The table the route is in, [`TABLE_MAIN`] unless set. The rules
+    /// choose the tables a packet is routed by.
+    #[cfg(target_os = "linux")]
+    pub table: u32,
     /// macOS interface-scoped routing (`RTF_IFSCOPE`). When set, the route
     /// is only matched by lookups whose `IP_BOUND_IF` scope equals this
     /// ifindex. Used to install a per-interface copy of the default route so
@@ -80,6 +97,10 @@ impl Route {
             prefix,
             gateway: None,
             ifindex: None,
+            #[cfg(target_os = "linux")]
+            kind: RouteKind::Unicast,
+            #[cfg(target_os = "linux")]
+            table: TABLE_MAIN,
             #[cfg(target_os = "macos")]
             scope_ifindex: None,
         }
@@ -113,6 +134,24 @@ impl Route {
             ));
         }
 
+        #[cfg(target_os = "linux")]
+        {
+            // The kernel takes table 0 for the main one; a route names it.
+            if self.table == 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "table 0 is not a table",
+                ));
+            }
+
+            if !self.kind.has_next_hop() && (self.gateway.is_some() || self.ifindex.is_some()) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("a {:?} route has no gateway or interface", self.kind),
+                ));
+            }
+        }
+
         Ok(())
     }
 
@@ -126,11 +165,53 @@ impl Route {
         self
     }
 
+    #[cfg(target_os = "linux")]
+    pub fn kind(mut self, kind: RouteKind) -> Route {
+        self.kind = kind;
+        self
+    }
+
+    #[cfg(target_os = "linux")]
+    pub fn table(mut self, table: u32) -> Route {
+        self.table = table;
+        self
+    }
+
     /// Scope this route to a specific interface (`RTF_IFSCOPE`).
     #[cfg(target_os = "macos")]
     pub fn ifscope(mut self, ifindex: u32) -> Route {
         self.scope_ifindex = Some(ifindex);
         self
+    }
+}
+
+/// What a route does with the traffic it matches.
+#[cfg(target_os = "linux")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum RouteKind {
+    /// Sends it through the gateway, or out of the interface.
+    Unicast,
+    /// Delivers it to this host, as the routes to the host's own addresses
+    /// in [`TABLE_LOCAL`] do.
+    Local,
+    /// Drops it.
+    Blackhole,
+    /// Drops it with an ICMP host unreachable; a local sender gets
+    /// `EHOSTUNREACH`.
+    Unreachable,
+    /// Drops it with an ICMP administratively prohibited; a local sender
+    /// gets `EACCES`.
+    Prohibit,
+    /// Ends the lookup in this table, so the rules after the one that chose
+    /// it go on.
+    Throw,
+}
+
+#[cfg(target_os = "linux")]
+impl RouteKind {
+    /// Whether a route of this kind leaves through a gateway or interface.
+    pub(crate) fn has_next_hop(self) -> bool {
+        matches!(self, RouteKind::Unicast | RouteKind::Local)
     }
 }
 
@@ -163,6 +244,41 @@ pub fn if_nametoindex(name: &str) -> Option<u32> {
 mod tests {
     use super::*;
     use std::net::{Ipv4Addr, Ipv6Addr};
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn validate_rejects_table_zero() {
+        let route = Route::default().table(0);
+
+        assert_eq!(
+            route.validate().unwrap_err().kind(),
+            io::ErrorKind::InvalidInput
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn validate_rejects_a_next_hop_for_a_route_that_drops_or_throws() {
+        let gateway = IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1));
+        for kind in [
+            RouteKind::Blackhole,
+            RouteKind::Unreachable,
+            RouteKind::Prohibit,
+            RouteKind::Throw,
+        ] {
+            let route = Route::default().kind(kind);
+            assert!(route.validate().is_ok());
+            for route in [route.gateway(gateway), route.ifindex(1)] {
+                assert_eq!(
+                    route.validate().unwrap_err().kind(),
+                    io::ErrorKind::InvalidInput
+                );
+            }
+        }
+        for kind in [RouteKind::Unicast, RouteKind::Local] {
+            assert!(Route::default().kind(kind).ifindex(1).validate().is_ok());
+        }
+    }
 
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]

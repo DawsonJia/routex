@@ -22,13 +22,13 @@ use netlink_packet_route::{
     },
 };
 
-use crate::{Route, RouteChange, fd, missing_route};
+use crate::{Route, RouteChange, RouteKind, fd, missing_route};
 
 /// Holds any datagram: the kernel sizes a dump datagram to the larger of
 /// 8 KiB and the reader's buffer.
 const RECV_BUF_LEN: usize = 16384;
 
-/// A netlink socket that changes and queries the main routing table.
+/// A netlink socket that changes and queries the routing tables.
 pub struct Handle {
     fd: OwnedFd,
     port_id: u32,
@@ -60,34 +60,26 @@ impl Handle {
         })
     }
 
-    /// Adds `route` to the main table; fails with `EEXIST` if it is there.
+    /// Adds `route` to `route.table`; fails with `AlreadyExists` if it is
+    /// there.
     pub fn add_route(&mut self, route: &Route) -> io::Result<()> {
         route.validate()?;
 
-        let mut rt_msg = change_message(route);
-        rt_msg.header.protocol = RouteProtocol::Boot;
-        rt_msg.header.kind = RouteType::Unicast;
-        // Without a gateway, the destination is on the link of the interface.
-        rt_msg.header.scope = if route.gateway.is_none() && route.ifindex.is_some() {
-            RouteScope::Link
-        } else {
-            RouteScope::Universe
-        };
-
         let sequence = self.request(
             NLM_F_EXCL | NLM_F_CREATE | NLM_F_ACK,
-            RouteNetlinkMessage::NewRoute(rt_msg),
+            RouteNetlinkMessage::NewRoute(add_message(route)),
         )?;
         self.replies(sequence, |message| Some(ack(message.payload)))
     }
 
-    /// Deletes the main-table route to `route.destination/prefix`, through
-    /// the gateway and interface of `route` where they are set; fails with
-    /// `NotFound` if there is none.
+    /// Deletes the route of `route.kind` to `route.destination/prefix` from
+    /// `route.table`, through the gateway and interface of `route` where they
+    /// are set; fails with `NotFound` if there is none.
     pub fn delete_route(&mut self, route: &Route) -> io::Result<()> {
         route.validate()?;
 
         let mut rt_msg = change_message(route);
+        // Any scope.
         rt_msg.header.scope = RouteScope::NoWhere;
 
         let sequence = self.request(NLM_F_ACK, RouteNetlinkMessage::DelRoute(rt_msg))?;
@@ -96,11 +88,12 @@ impl Handle {
     }
 
     /// How the kernel routes `route.destination`, out of `route.ifindex` if
-    /// it is set: the gateway and interface it picks, for the destination as
-    /// a host route. The unspecified address with prefix 0 asks for the
-    /// main-table default route instead, through the gateway and interface of
-    /// `route` where they are set; one that leaves through several live next
-    /// hops, or a nexthop object, is an error.
+    /// it is set: the route it picks, for the destination as a host route,
+    /// with the table and kind of the entry it found through the rules. The
+    /// unspecified address with prefix 0 asks for the default route of
+    /// `route.kind` in `route.table` instead, through the gateway and
+    /// interface of `route` where they are set; one that leaves through
+    /// several live next hops, or a nexthop object, is an error.
     pub fn get_route(&mut self, route: &Route) -> io::Result<Route> {
         route.validate()?;
 
@@ -112,7 +105,9 @@ impl Handle {
 
         // Not RTM_F_FIB_MATCH: the table entry of a multipath route has every
         // next hop, while a lookup answers with the one the kernel picks.
-        let rt_msg = route_message(route);
+        // Without RTM_F_LOOKUP_TABLE, IPv4 reports any table as main.
+        let mut rt_msg = route_message(route);
+        rt_msg.header.flags = RouteFlags::LookupTable;
         let sequence = self.request(0, RouteNetlinkMessage::GetRoute(rt_msg))?;
         self.replies(sequence, |message| {
             Some(match message.payload {
@@ -205,7 +200,7 @@ impl Handle {
     }
 }
 
-/// A netlink socket that reports the changes to the main routing table.
+/// A netlink socket that reports the changes to the routing tables.
 pub struct RouteMonitor {
     fd: OwnedFd,
     buf: Box<[u8]>,
@@ -238,7 +233,7 @@ impl RouteMonitor {
         })
     }
 
-    /// Blocks until the next change to the main routing table.
+    /// Blocks until the next change to a routing table.
     pub fn recv(&mut self) -> io::Result<(RouteChange, Route)> {
         loop {
             if let Some(change) = self.pending.pop_front() {
@@ -313,10 +308,31 @@ fn route_message(route: &Route) -> RouteMessage {
     rt_msg
 }
 
-/// A message that adds `route` to or deletes it from the main table.
+/// A message that adds `route` to its table.
+fn add_message(route: &Route) -> RouteMessage {
+    let mut rt_msg = change_message(route);
+    rt_msg.header.protocol = RouteProtocol::Boot;
+    rt_msg.header.scope = match route.kind {
+        RouteKind::Local => RouteScope::Host,
+        // Without a gateway, the destination is on the link of the interface.
+        RouteKind::Unicast if route.gateway.is_none() && route.ifindex.is_some() => {
+            RouteScope::Link
+        }
+        _ => RouteScope::Universe,
+    };
+
+    rt_msg
+}
+
+/// A message that selects `route` in its table, to add or delete it.
 fn change_message(route: &Route) -> RouteMessage {
     let mut rt_msg = route_message(route);
-    rt_msg.header.table = RouteHeader::RT_TABLE_MAIN;
+    rt_msg.header.kind = route_type(route.kind);
+    // Tables above 255 only fit in the attribute.
+    rt_msg.header.table = u8::try_from(route.table).unwrap_or(RouteHeader::RT_TABLE_UNSPEC);
+    if route.table > u32::from(u8::MAX) {
+        rt_msg.attributes.push(RouteAttribute::Table(route.table));
+    }
     if let Some(gateway) = route.gateway {
         rt_msg
             .attributes
@@ -341,11 +357,15 @@ fn route_from_message(rt_msg: &RouteMessage) -> Result<Route, &'static str> {
     })
 }
 
-/// The destination of `rt_msg`, as a route through no next hop, and the next
-/// hop that its own attributes name, as against those in RTA_MULTIPATH.
+/// The destination, kind and table of `rt_msg`, as a route through no next
+/// hop, and the next hop that its own attributes name, as against those in
+/// RTA_MULTIPATH.
 fn parse_route(rt_msg: &RouteMessage) -> Result<(Route, NextHop), &'static str> {
     let family = rt_msg.header.address_family;
-    let mut entry = Route::new(unspecified(family), rt_msg.header.destination_prefix_length);
+    let kind = route_kind(rt_msg.header.kind).ok_or("a Route cannot hold a route of this type")?;
+    let mut entry = Route::new(unspecified(family), rt_msg.header.destination_prefix_length)
+        .kind(kind)
+        .table(table(rt_msg));
     let mut ifindex = None;
     for attr in &rt_msg.attributes {
         match attr {
@@ -357,6 +377,10 @@ fn parse_route(rt_msg: &RouteMessage) -> Result<(Route, NextHop), &'static str> 
         }
     }
 
+    // IPv6 hangs the routes that drop or throw off the loopback interface.
+    if !kind.has_next_hop() {
+        return Ok((entry, (Ok(None), None)));
+    }
     Ok((entry, next_hop(&rt_msg.attributes, ifindex, family)))
 }
 
@@ -383,26 +407,47 @@ fn next_hop(attrs: &[RouteAttribute], ifindex: Option<u32>, family: AddressFamil
     (gateway, ifindex)
 }
 
-/// Whether `rt_msg` is a route of the main table, the only table this crate
-/// adds to and deletes from.
-fn in_main_table(rt_msg: &RouteMessage) -> bool {
+/// The table of `rt_msg`.
+fn table(rt_msg: &RouteMessage) -> u32 {
     // Tables above 255 only fit in the attribute.
-    let table = rt_msg
+    rt_msg
         .attributes
         .iter()
         .find_map(|attr| match attr {
             RouteAttribute::Table(table) => Some(*table),
             _ => None,
         })
-        .unwrap_or(rt_msg.header.table.into());
-
-    table == u32::from(RouteHeader::RT_TABLE_MAIN)
+        .unwrap_or(rt_msg.header.table.into())
 }
 
-/// A live main-table unicast default route that applies to any packet,
-/// with the metric the kernel ranks it by, if a live next hop of it matches
-/// the selectors of `route`. It is an error when it would not leave through
-/// one known next hop, which is all a `Route` can hold.
+fn route_type(kind: RouteKind) -> RouteType {
+    match kind {
+        RouteKind::Unicast => RouteType::Unicast,
+        RouteKind::Local => RouteType::Local,
+        RouteKind::Blackhole => RouteType::BlackHole,
+        RouteKind::Unreachable => RouteType::Unreachable,
+        RouteKind::Prohibit => RouteType::Prohibit,
+        RouteKind::Throw => RouteType::Throw,
+    }
+}
+
+/// The kind of a route of type `kind`, unless a `Route` cannot hold it.
+fn route_kind(kind: RouteType) -> Option<RouteKind> {
+    Some(match kind {
+        RouteType::Unicast => RouteKind::Unicast,
+        RouteType::Local => RouteKind::Local,
+        RouteType::BlackHole => RouteKind::Blackhole,
+        RouteType::Unreachable => RouteKind::Unreachable,
+        RouteType::Prohibit => RouteKind::Prohibit,
+        RouteType::Throw => RouteKind::Throw,
+        _ => return None,
+    })
+}
+
+/// A live default route of the kind and table of `route` that applies to
+/// any packet, with the metric the kernel ranks it by, if a live next hop of
+/// it matches the selectors of `route`. It is an error when it would not
+/// leave through one known next hop, which is all a `Route` can hold.
 fn default_route_candidate(
     rt_msg: &RouteMessage,
     route: &Route,
@@ -412,9 +457,9 @@ fn default_route_candidate(
     if header.destination_prefix_length != 0
         || header.source_prefix_length != 0
         || header.tos != 0
-        || header.kind != RouteType::Unicast
+        || header.kind != route_type(route.kind)
         || header.flags.contains(RouteFlags::Dead)
-        || !in_main_table(rt_msg)
+        || table(rt_msg) != route.table
     {
         return None;
     }
@@ -564,12 +609,12 @@ fn enqueue_route_changes(
             _ => continue,
         };
 
+        // A route of a type a `Route` cannot hold, such as the broadcast and
+        // multicast ones of the local table, is skipped.
         // TODO: a route through a gateway of another family is skipped, and
         // one with several next hops (RTA_MULTIPATH), or with only a nexthop
         // object under `nexthop_compat_mode` off, reports none.
-        if in_main_table(&rt_msg)
-            && let Ok(route) = route_from_message(&rt_msg)
-        {
+        if let Ok(route) = route_from_message(&rt_msg) {
             pending.push_back((change, route));
         }
     }
@@ -631,6 +676,7 @@ mod tests {
     use netlink_packet_route::route::{RouteNextHop, RouteVia};
 
     use super::*;
+    use crate::{TABLE_LOCAL, TABLE_MAIN};
 
     fn message(
         sequence: u32,
@@ -655,14 +701,8 @@ mod tests {
         message(sequence, port_number, NetlinkPayload::Error(error_message))
     }
 
-    fn main_table_message(route: &Route) -> RouteMessage {
-        let mut rt_msg = change_message(route);
-        rt_msg.header.kind = RouteType::Unicast;
-        rt_msg
-    }
-
     fn route_message(destination: Ipv4Addr, deleted: bool) -> NetlinkMessage<RouteNetlinkMessage> {
-        let rt_msg = main_table_message(&Route::new(IpAddr::V4(destination), 32));
+        let rt_msg = change_message(&Route::new(IpAddr::V4(destination), 32));
         let payload = if deleted {
             RouteNetlinkMessage::DelRoute(rt_msg)
         } else {
@@ -720,6 +760,14 @@ mod tests {
             let n = kernel.recv(&mut buf).unwrap();
             let request = parse_nlmsgs(&buf[..n]).unwrap().remove(0);
             assert_eq!(request.header.flags & NLM_F_DUMP == NLM_F_DUMP, dump);
+            if !dump {
+                let NetlinkPayload::InnerMessage(RouteNetlinkMessage::GetRoute(lookup)) =
+                    &request.payload
+                else {
+                    panic!("not a route lookup: {request:?}");
+                };
+                assert!(lookup.header.flags.contains(RouteFlags::LookupTable));
+            }
             for (flags, payload) in replies {
                 let header = request.header;
                 let mut reply = message(header.sequence_number, header.port_number, payload);
@@ -755,7 +803,7 @@ mod tests {
         let route = Route::default()
             .gateway(IpAddr::V4(gateway))
             .ifindex(ifindex);
-        let mut rt_msg = main_table_message(&route);
+        let mut rt_msg = change_message(&route);
         // The kernel leaves out the destination of a /0 route.
         rt_msg
             .attributes
@@ -822,32 +870,54 @@ mod tests {
     }
 
     #[test]
-    fn route_changes_are_reported_for_every_route_of_the_main_table_only() {
-        let mut local = main_table_message(&Route::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 32));
-        local.header.table = 255;
-        local.header.kind = RouteType::Local;
-        let mut policy = main_table_message(&Route::default());
+    fn route_changes_of_every_table_are_reported_with_their_table_and_kind() {
+        let lo = 1;
+        let local = Route::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 32)
+            .kind(RouteKind::Local)
+            .table(TABLE_LOCAL)
+            .ifindex(lo);
+        let mut broadcast = change_message(&local);
+        broadcast.header.kind = RouteType::Broadcast;
+        let mut policy = change_message(&Route::default().ifindex(7));
         // RT_TABLE_COMPAT: the real table only fits in the attribute.
         policy.header.table = 252;
         policy.attributes.push(RouteAttribute::Table(51820));
-        let mut blackhole =
-            main_table_message(&Route::new(IpAddr::V4(Ipv4Addr::new(198, 18, 0, 0)), 24));
-        blackhole.header.kind = RouteType::BlackHole;
-        let main = main_table_message(&Route::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)), 32));
-        let messages = [local, policy, blackhole, main]
-            .into_iter()
-            .map(|rt_msg| message(0, 0, new_route(rt_msg)))
-            .collect();
+        let blackhole = Route::new(IpAddr::V4(Ipv4Addr::new(198, 18, 0, 0)), 24)
+            .kind(RouteKind::Blackhole)
+            .table(220);
+        // IPv6 hangs a route that drops off the loopback interface.
+        let unreachable = Route::new(
+            IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 0)),
+            32,
+        )
+        .kind(RouteKind::Unreachable);
+        let mut unreachable_message = change_message(&unreachable);
+        unreachable_message.attributes.push(RouteAttribute::Oif(lo));
+        let main = Route::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)), 32);
+        let messages = [
+            change_message(&local),
+            broadcast,
+            policy,
+            change_message(&blackhole),
+            unreachable_message,
+            change_message(&main),
+        ]
+        .into_iter()
+        .map(|rt_msg| message(0, 0, new_route(rt_msg)))
+        .collect();
 
         let mut pending = VecDeque::new();
         enqueue_route_changes(messages, &mut pending).unwrap();
 
-        let destinations: Vec<_> = pending.iter().map(|(_, route)| route.destination).collect();
+        let routes: Vec<_> = pending.into_iter().map(|(_, route)| route).collect();
         assert_eq!(
-            destinations,
+            routes,
             [
-                IpAddr::V4(Ipv4Addr::new(198, 18, 0, 0)),
-                IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1))
+                local,
+                Route::default().ifindex(7).table(51820),
+                blackhole,
+                unreachable,
+                main
             ]
         );
     }
@@ -912,6 +982,28 @@ mod tests {
     }
 
     #[test]
+    fn default_route_candidates_are_of_the_table_and_kind_asked_for() {
+        let any = Route::default();
+        let tunnel = Route::default().ifindex(9).table(51888);
+        let kill_switch = Route::default().kind(RouteKind::Blackhole).table(51888);
+        let main = default_route(Ipv4Addr::new(192, 168, 1, 1), 2, None);
+
+        assert!(default_route_candidate(&change_message(&tunnel), &any).is_none());
+        assert!(default_route_candidate(&main, &any.table(51888)).is_none());
+        assert_eq!(
+            default_route_candidate(&change_message(&tunnel), &any.table(51888)),
+            Some((0, Ok(tunnel)))
+        );
+        assert!(
+            default_route_candidate(&change_message(&kill_switch), &any.table(51888)).is_none()
+        );
+        assert_eq!(
+            default_route_candidate(&change_message(&kill_switch), &kill_switch),
+            Some((0, Ok(kill_switch)))
+        );
+    }
+
+    #[test]
     fn multipath_default_route_is_a_route_through_its_one_selected_live_next_hop() {
         let any = Route::default();
         let first = IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1));
@@ -967,7 +1059,7 @@ mod tests {
         enqueue_route_changes(vec![message(0, 0, new_route(rt_msg))], &mut pending).unwrap();
         assert!(pending.is_empty());
 
-        let reply = through_ipv6_gateway(main_table_message(
+        let reply = through_ipv6_gateway(change_message(
             &Route::new(IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1)), 32).ifindex(2),
         ));
         let error = get_from_fake_kernel(
@@ -1026,6 +1118,32 @@ mod tests {
     }
 
     #[test]
+    fn lookup_reports_the_table_and_kind_of_the_route_found() {
+        let found = Route::new(IpAddr::V4(Ipv4Addr::new(198, 18, 1, 1)), 32)
+            .ifindex(9)
+            .table(51888);
+        let local = Route::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 32)
+            .kind(RouteKind::Local)
+            .table(TABLE_LOCAL)
+            .ifindex(1);
+
+        for route in [found, local] {
+            let query = Route::new(route.destination, 32);
+            let reply = vec![(0, new_route(change_message(&route)))];
+            assert_eq!(get_from_fake_kernel(query, reply).unwrap(), route);
+        }
+
+        let mut broadcast = change_message(&local);
+        broadcast.header.kind = RouteType::Broadcast;
+        let error = get_from_fake_kernel(
+            Route::new(local.destination, 32),
+            vec![(0, new_route(broadcast))],
+        )
+        .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::Unsupported);
+    }
+
+    #[test]
     fn default_route_dump_picks_the_lowest_metric() {
         let route = get_from_fake_kernel(
             Route::default(),
@@ -1040,7 +1158,7 @@ mod tests {
                 ),
                 (
                     0,
-                    new_route(main_table_message(&Route::new(
+                    new_route(change_message(&Route::new(
                         IpAddr::V4(Ipv4Addr::new(10, 0, 0, 0)),
                         8,
                     ))),
@@ -1118,14 +1236,89 @@ mod tests {
         );
     }
 
+    fn table_attribute(rt_msg: &RouteMessage) -> Option<u32> {
+        rt_msg.attributes.iter().find_map(|attr| match attr {
+            RouteAttribute::Table(table) => Some(*table),
+            _ => None,
+        })
+    }
+
     #[test]
-    fn change_message_selects_the_main_table_route() {
+    fn change_message_puts_a_table_above_255_in_the_attribute_only() {
+        let route = Route::new(IpAddr::V4(Ipv4Addr::new(198, 18, 0, 0)), 24);
+
+        for (table, header, attribute) in [
+            (TABLE_MAIN, TABLE_MAIN as u8, None),
+            (255, 255, None),
+            (256, RouteHeader::RT_TABLE_UNSPEC, Some(256)),
+            (51888, RouteHeader::RT_TABLE_UNSPEC, Some(51888)),
+        ] {
+            let message = change_message(&route.table(table));
+            assert_eq!(message.header.table, header);
+            assert_eq!(table_attribute(&message), attribute);
+            assert_eq!(super::table(&message), table);
+        }
+    }
+
+    #[test]
+    fn add_message_has_the_type_and_scope_of_the_kind() {
+        let route = Route::new(IpAddr::V4(Ipv4Addr::new(198, 18, 0, 0)), 24);
+        let gateway = IpAddr::V4(Ipv4Addr::new(198, 18, 0, 1));
+
+        for (route, kind, scope) in [
+            (
+                route.gateway(gateway),
+                RouteType::Unicast,
+                RouteScope::Universe,
+            ),
+            (
+                route.gateway(gateway).ifindex(2),
+                RouteType::Unicast,
+                RouteScope::Universe,
+            ),
+            (route.ifindex(2), RouteType::Unicast, RouteScope::Link),
+            (
+                route.kind(RouteKind::Local).ifindex(1),
+                RouteType::Local,
+                RouteScope::Host,
+            ),
+            (
+                route.kind(RouteKind::Blackhole),
+                RouteType::BlackHole,
+                RouteScope::Universe,
+            ),
+            (
+                route.kind(RouteKind::Unreachable),
+                RouteType::Unreachable,
+                RouteScope::Universe,
+            ),
+            (
+                route.kind(RouteKind::Prohibit),
+                RouteType::Prohibit,
+                RouteScope::Universe,
+            ),
+            (
+                route.kind(RouteKind::Throw),
+                RouteType::Throw,
+                RouteScope::Universe,
+            ),
+        ] {
+            let message = add_message(&route);
+            assert_eq!((message.header.kind, message.header.scope), (kind, scope));
+            assert_eq!(message.header.protocol, RouteProtocol::Boot);
+            assert_eq!(route_from_message(&message), Ok(route));
+        }
+    }
+
+    #[test]
+    fn change_message_selects_the_route_in_its_table() {
         let route = Route::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 0)), 24)
             .gateway(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)))
             .ifindex(7);
         let message = change_message(&route);
 
         assert_eq!(message.header.table, RouteHeader::RT_TABLE_MAIN);
+        assert_eq!(message.header.kind, RouteType::Unicast);
         assert!(message.attributes.iter().any(|attribute| {
             matches!(attribute, RouteAttribute::Gateway(RouteAddress::Inet(address)) if *address == Ipv4Addr::new(10, 0, 0, 1))
         }));
@@ -1177,14 +1370,19 @@ mod tests {
 
     #[test]
     #[ignore = "requires CAP_NET_ADMIN and temporarily installs a reserved test route"]
-    fn monitor_reports_an_added_and_deleted_route() {
+    fn monitor_reports_added_and_deleted_routes_of_every_table() {
         let lo = crate::if_nametoindex("lo").unwrap();
         let route = Route::new(IpAddr::V4(Ipv4Addr::new(198, 18, 254, 0)), 24).ifindex(lo);
+        let throw = Route::new(route.destination, 24)
+            .kind(RouteKind::Throw)
+            .table(LIVE_TABLE);
         let mut monitor = RouteMonitor::new().unwrap();
         let mut handle = Handle::new().unwrap();
 
         handle.add_route(&route).unwrap();
+        handle.add_route(&throw).unwrap();
         handle.delete_route(&route).unwrap();
+        handle.delete_route(&throw).unwrap();
 
         let mut next = || loop {
             let change = monitor.recv().unwrap();
@@ -1193,6 +1391,57 @@ mod tests {
             }
         };
         assert_eq!(next(), (RouteChange::Add, route));
+        assert_eq!(next(), (RouteChange::Add, throw));
         assert_eq!(next(), (RouteChange::Delete, route));
+        assert_eq!(next(), (RouteChange::Delete, throw));
+    }
+
+    /// Tables no system uses, one that fits in the header and one that does
+    /// not, for the live tests.
+    const LIVE_TABLE: u32 = 3_198_018;
+    const LIVE_SMALL_TABLE: u32 = 218;
+
+    #[test]
+    #[ignore = "requires CAP_NET_ADMIN and temporarily installs reserved test routes"]
+    fn routes_of_every_kind_round_trip_through_a_table() {
+        let lo = crate::if_nametoindex("lo").unwrap();
+        let host = |last| Route::new(IpAddr::V4(Ipv4Addr::new(198, 18, 253, last)), 32);
+        let mut handle = Handle::new().unwrap();
+
+        for table in [LIVE_SMALL_TABLE, LIVE_TABLE] {
+            let routes = [
+                Route::default().ifindex(lo),
+                host(1).ifindex(lo),
+                host(2).kind(RouteKind::Local).ifindex(lo),
+                host(3).kind(RouteKind::Blackhole),
+                host(4).kind(RouteKind::Unreachable),
+                host(5).kind(RouteKind::Prohibit),
+                host(6).kind(RouteKind::Throw),
+            ]
+            .map(|route| route.table(table));
+
+            for route in &routes {
+                let added = handle.add_route(route);
+                let duplicate = handle.add_route(route);
+                let default = route
+                    .destination
+                    .is_unspecified()
+                    .then(|| handle.get_route(&Route::default().table(table)));
+                let deleted = handle.delete_route(route);
+                let missing = handle.delete_route(route);
+
+                added.unwrap_or_else(|error| panic!("add {route:?}: {error}"));
+                assert_eq!(
+                    duplicate.unwrap_err().kind(),
+                    io::ErrorKind::AlreadyExists,
+                    "{route:?}"
+                );
+                if let Some(default) = default {
+                    assert_eq!(default.unwrap(), *route);
+                }
+                deleted.unwrap();
+                assert_eq!(missing.unwrap_err().kind(), io::ErrorKind::NotFound);
+            }
+        }
     }
 }
