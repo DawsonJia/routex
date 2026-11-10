@@ -1,3 +1,4 @@
+mod interface;
 mod rtmsg;
 
 use std::{
@@ -14,7 +15,7 @@ use libc::{
     RTM_DELETE, RTM_GET, SHUT_RD, SOCK_RAW,
 };
 
-use crate::{Route, RouteChange, fd, missing_route};
+use crate::{Address, Route, RouteChange, fd, missing_route};
 use rtmsg::{MESSAGE_CAPACITY, Message, Writer, message_type};
 
 /// `RTF_IFSCOPE` is the XNU flag that ties a route to a specific interface
@@ -33,7 +34,8 @@ const REPLY_TIMEOUT: Duration = Duration::from_secs(1);
 
 /// A routing socket that changes and queries the routing table.
 /// `add_route` and `delete_route` use it, so options set through
-/// [`AsRawFd`] apply to them; every `get_route` opens a socket of its own.
+/// [`AsRawFd`] apply to them; every `get_route`, and every change to an
+/// address or a link, which is an ioctl, opens a socket of its own.
 pub struct Handle {
     fd: OwnedFd,
 }
@@ -95,6 +97,45 @@ impl Handle {
         fd::send(socket.as_fd(), &request(route, RTM_GET, seq))?;
 
         read_reply(socket.as_fd(), seq)
+    }
+
+    /// Makes `address` an address of its interface, whether or not it is
+    /// one already. An interface has an `ip` once, so this changes the
+    /// prefix and peer of the one that is there; an IPv6 one is deleted and
+    /// added again for it.
+    ///
+    /// A peer takes a point-to-point interface, such as a `utun`. There, an
+    /// IPv4 address without a peer is the first IPv4 address of the
+    /// interface or none: this fails with `InvalidInput`, and changes
+    /// nothing, where it would take the place of another address, or keep
+    /// the peer the address has.
+    pub fn replace_address(&mut self, address: &Address) -> io::Result<()> {
+        address.validate()?;
+
+        interface::replace_address(address)
+    }
+
+    /// Deletes the address `address.ip` from its interface, whatever its
+    /// prefix and peer; fails with `NotFound` if there is none.
+    pub fn delete_address(&mut self, address: &Address) -> io::Result<()> {
+        address.validate()?;
+
+        interface::delete_address(address)
+    }
+
+    /// Sets the MTU of the interface `ifindex`.
+    pub fn set_link_mtu(&mut self, ifindex: u32, mtu: u32) -> io::Result<()> {
+        interface::set_mtu(ifindex, mtu)
+    }
+
+    /// The MTU of the interface `ifindex`.
+    pub fn get_link_mtu(&mut self, ifindex: u32) -> io::Result<u32> {
+        interface::get_mtu(ifindex)
+    }
+
+    /// Brings the interface `ifindex` up, or down.
+    pub fn set_link_up(&mut self, ifindex: u32, up: bool) -> io::Result<()> {
+        interface::set_up(ifindex, up)
     }
 }
 
@@ -296,13 +337,20 @@ fn read_route(message: &Message<'_>) -> io::Result<Route> {
 }
 
 fn netmask(route: &Route) -> IpAddr {
-    let host_bits = u32::from(route.max_prefix() - route.prefix);
     match route.destination {
-        IpAddr::V4(_) => IpAddr::V4(Ipv4Addr::from(u32::MAX.checked_shl(host_bits).unwrap_or(0))),
-        IpAddr::V6(_) => IpAddr::V6(Ipv6Addr::from(
-            u128::MAX.checked_shl(host_bits).unwrap_or(0),
-        )),
+        IpAddr::V4(_) => IpAddr::V4(v4_netmask(route.prefix)),
+        IpAddr::V6(_) => IpAddr::V6(v6_netmask(route.prefix)),
     }
+}
+
+/// The netmask of a prefix of at most 32 bits.
+fn v4_netmask(prefix: u8) -> Ipv4Addr {
+    Ipv4Addr::from(u32::MAX.checked_shl(32 - u32::from(prefix)).unwrap_or(0))
+}
+
+/// The netmask of a prefix of at most 128 bits.
+fn v6_netmask(prefix: u8) -> Ipv6Addr {
+    Ipv6Addr::from(u128::MAX.checked_shl(128 - u32::from(prefix)).unwrap_or(0))
 }
 
 fn prefix_len(netmask: IpAddr) -> u8 {
