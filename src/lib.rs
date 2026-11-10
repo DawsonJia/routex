@@ -20,18 +20,6 @@ macro_rules! syscall {
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 mod fd;
-
-/// Linux and macOS fail to delete a route that is not there with `ESRCH`,
-/// which is `NotFound` here, as on Windows, with the kernel's error as its
-/// source.
-#[cfg(any(target_os = "linux", target_os = "macos"))]
-fn missing_route(error: io::Error) -> io::Error {
-    if error.raw_os_error() == Some(libc::ESRCH) {
-        io::Error::new(io::ErrorKind::NotFound, error)
-    } else {
-        error
-    }
-}
 #[cfg(target_os = "linux")]
 mod linux;
 #[cfg(target_os = "macos")]
@@ -59,6 +47,18 @@ pub const TABLE_MAIN: u32 = 254;
 /// The table the last of the kernel's own rules looks up (`default`).
 #[cfg(target_os = "linux")]
 pub const TABLE_DEFAULT: u32 = 253;
+
+/// Linux and macOS fail to delete a route that is not there with `ESRCH`,
+/// which is `NotFound` here, as on Windows, with the kernel's error as its
+/// source.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn missing_route(error: io::Error) -> io::Error {
+    if error.raw_os_error() == Some(libc::ESRCH) {
+        io::Error::new(io::ErrorKind::NotFound, error)
+    } else {
+        error
+    }
+}
 
 /// A route: traffic to `destination/prefix` goes through `gateway`, or
 /// straight out of interface `ifindex`.
@@ -198,7 +198,7 @@ pub enum RouteKind {
     /// Delivers it to this host, as the routes to the host's own addresses
     /// in [`TABLE_LOCAL`] do.
     Local,
-    /// Drops it.
+    /// Drops it; a local sender gets `EINVAL`.
     Blackhole,
     /// Drops it with an ICMP host unreachable; a local sender gets
     /// `EHOSTUNREACH`.

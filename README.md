@@ -123,7 +123,8 @@ fn main() {}
   a route of its kind, though for IPv6 the kernel ignores the kind.
 - On Linux, a lookup goes through the rules as a packet does, so `get_route`
   of a destination ignores `table` and `kind` and reports those of the route
-  it found. A destination routed by a route of another type, such as
+  it found, or table 0 if the kernel routed it by none, as it does the
+  unspecified address. A destination routed by a route of another type, such as
   broadcast or multicast, is an error.
 - A `Route` holds a gateway of the family of its destination, so on Linux a
   route through a gateway of another family, an IPv4 route through an IPv6

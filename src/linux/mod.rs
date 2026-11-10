@@ -92,8 +92,8 @@ impl Handle {
 
     /// How the kernel routes `route.destination`, out of `route.ifindex` if
     /// it is set: the route it picks, for the destination as a host route,
-    /// with the table and kind of the entry it found through the rules. The
-    /// unspecified address with prefix 0 asks for the default route of
+    /// with the table and kind of the entry it found through the rules, or
+    /// table 0 if it routed the destination by none. The unspecified address with prefix 0 asks for the default route of
     /// `route.kind` in `route.table` instead, through the gateway and
     /// interface of `route` where they are set; one that leaves through
     /// several live next hops, or a nexthop object, is an error.
