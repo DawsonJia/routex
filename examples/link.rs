@@ -23,15 +23,28 @@ fn main() -> Result<(), Box<dyn Error>> {
     match command.as_str() {
         "show" => println!("{name}: mtu {}", handle.get_link_mtu(ifindex)?),
         "set" => {
+            // The whole command is read before any of it changes the link.
+            let mut mtu = None;
+            let mut up = None;
             while let Some(key) = args.next() {
                 match key.as_str() {
-                    "mtu" => handle.set_link_mtu(ifindex, args.next().ok_or(USAGE)?.parse()?)?,
-                    #[cfg(not(target_os = "windows"))]
-                    "up" => handle.set_link_up(ifindex, true)?,
-                    #[cfg(not(target_os = "windows"))]
-                    "down" => handle.set_link_up(ifindex, false)?,
+                    "mtu" => mtu = Some(args.next().ok_or(USAGE)?.parse()?),
+                    "up" => up = Some(true),
+                    "down" => up = Some(false),
                     _ => return Err(USAGE.into()),
                 }
+            }
+            #[cfg(target_os = "windows")]
+            if up.is_some() {
+                return Err("a link goes neither up nor down on Windows".into());
+            }
+
+            if let Some(mtu) = mtu {
+                handle.set_link_mtu(ifindex, mtu)?;
+            }
+            #[cfg(not(target_os = "windows"))]
+            if let Some(up) = up {
+                handle.set_link_up(ifindex, up)?;
             }
         }
         _ => return Err(USAGE.into()),
