@@ -11,8 +11,8 @@ use libc::{
     sockaddr_nl,
 };
 use netlink_packet_core::{
-    ErrorMessage, NLM_F_ACK, NLM_F_CREATE, NLM_F_DUMP, NLM_F_DUMP_INTR, NLM_F_EXCL, NLM_F_REQUEST,
-    NetlinkHeader, NetlinkMessage, NetlinkPayload, Nla,
+    ErrorMessage, NLM_F_ACK, NLM_F_CREATE, NLM_F_DUMP, NLM_F_DUMP_INTR, NLM_F_EXCL, NLM_F_REPLACE,
+    NLM_F_REQUEST, NetlinkHeader, NetlinkMessage, NetlinkPayload, Nla,
 };
 use netlink_packet_route::{
     AddressFamily, RouteNetlinkMessage,
@@ -22,8 +22,10 @@ use netlink_packet_route::{
     },
 };
 
-use crate::{Route, RouteChange, RouteKind, Rule, fd, missing_route};
+use crate::{Address, Route, RouteChange, RouteKind, Rule, fd, missing_address, missing_route};
 
+mod address;
+mod link;
 mod rule;
 
 /// Holds any datagram: the kernel sizes a dump datagram to the larger of
@@ -31,7 +33,8 @@ mod rule;
 const RECV_BUF_LEN: usize = 16384;
 
 /// A netlink socket that changes and queries the routing tables, and
-/// changes the rules that choose between them.
+/// changes the rules that choose between them, and the addresses and links
+/// of the interfaces.
 pub struct Handle {
     fd: OwnedFd,
     port_id: u32,
@@ -68,11 +71,10 @@ impl Handle {
     pub fn add_route(&mut self, route: &Route) -> io::Result<()> {
         route.validate()?;
 
-        let sequence = self.request(
-            NLM_F_EXCL | NLM_F_CREATE | NLM_F_ACK,
+        self.change(
+            NLM_F_EXCL | NLM_F_CREATE,
             RouteNetlinkMessage::NewRoute(add_message(route)),
-        )?;
-        self.replies(sequence, |message| Some(ack(message.payload)))
+        )
     }
 
     /// Deletes the route of `route.kind` to `route.destination/prefix` from
@@ -85,8 +87,7 @@ impl Handle {
         // Any scope.
         rt_msg.header.scope = RouteScope::NoWhere;
 
-        let sequence = self.request(NLM_F_ACK, RouteNetlinkMessage::DelRoute(rt_msg))?;
-        self.replies(sequence, |message| Some(ack(message.payload)))
+        self.change(0, RouteNetlinkMessage::DelRoute(rt_msg))
             .map_err(missing_route)
     }
 
@@ -129,11 +130,10 @@ impl Handle {
     pub fn add_rule(&mut self, rule: &Rule) -> io::Result<()> {
         rule.validate()?;
 
-        let sequence = self.request(
-            NLM_F_EXCL | NLM_F_CREATE | NLM_F_ACK,
+        self.change(
+            NLM_F_EXCL | NLM_F_CREATE,
             RouteNetlinkMessage::NewRule(rule::rule_message(rule)),
-        )?;
-        self.replies(sequence, |message| Some(ack(message.payload)))
+        )
     }
 
     /// Deletes the first rule, by priority, with the action of `rule` and
@@ -143,11 +143,64 @@ impl Handle {
     pub fn delete_rule(&mut self, rule: &Rule) -> io::Result<()> {
         rule.validate()?;
 
-        let sequence = self.request(
-            NLM_F_ACK,
-            RouteNetlinkMessage::DelRule(rule::rule_message(rule)),
-        )?;
-        self.replies(sequence, |message| Some(ack(message.payload)))
+        self.change(0, RouteNetlinkMessage::DelRule(rule::rule_message(rule)))
+    }
+
+    /// Makes `address` an address of its interface, whether or not it is
+    /// one already. An IPv4 address is its `ip`, `prefix` and `peer`: with
+    /// another prefix or peer it is another address, added beside the one
+    /// that is there. An interface has an IPv6 `ip` once: the kernel changes
+    /// the peer of the one that is there, and leaves its prefix as it is.
+    pub fn replace_address(&mut self, address: &Address) -> io::Result<()> {
+        address.validate()?;
+
+        self.change(
+            NLM_F_CREATE | NLM_F_REPLACE,
+            RouteNetlinkMessage::NewAddress(address::address_message(address)),
+        )
+    }
+
+    /// Deletes the address `address.ip/prefix` from its interface: for
+    /// IPv4, the first whose peer, or else itself, is in the prefix of that
+    /// of `address`. Fails with `NotFound` if there is none.
+    pub fn delete_address(&mut self, address: &Address) -> io::Result<()> {
+        address.validate()?;
+
+        self.change(
+            0,
+            RouteNetlinkMessage::DelAddress(address::address_message(address)),
+        )
+        .map_err(missing_address)
+    }
+
+    /// Sets the MTU of the interface `ifindex`.
+    pub fn set_link_mtu(&mut self, ifindex: u32, mtu: u32) -> io::Result<()> {
+        self.change(
+            0,
+            RouteNetlinkMessage::SetLink(link::mtu_message(ifindex, mtu)),
+        )
+    }
+
+    /// The MTU of the interface `ifindex`.
+    pub fn get_link_mtu(&mut self, ifindex: u32) -> io::Result<u32> {
+        let sequence =
+            self.request(0, RouteNetlinkMessage::GetLink(link::link_message(ifindex)))?;
+        self.replies(sequence, |message| {
+            Some(match message.payload {
+                NetlinkPayload::InnerMessage(RouteNetlinkMessage::NewLink(link)) => {
+                    link::mtu(&link).ok_or_else(|| io::Error::other("a link without an MTU"))
+                }
+                payload => Err(unexpected_reply(payload)),
+            })
+        })
+    }
+
+    /// Brings the interface `ifindex` up, or down.
+    pub fn set_link_up(&mut self, ifindex: u32, up: bool) -> io::Result<()> {
+        self.change(
+            0,
+            RouteNetlinkMessage::SetLink(link::up_message(ifindex, up)),
+        )
     }
 
     fn default_route(&mut self, route: &Route) -> io::Result<Route> {
@@ -190,6 +243,13 @@ impl Handle {
                 payload => Some(Err(unexpected_reply(payload))),
             }
         })
+    }
+
+    /// Sends `message` as a request with `flags`, which the kernel carries
+    /// out and acknowledges, or fails.
+    fn change(&mut self, flags: u16, message: RouteNetlinkMessage) -> io::Result<()> {
+        let sequence = self.request(flags | NLM_F_ACK, message)?;
+        self.replies(sequence, |message| Some(ack(message.payload)))
     }
 
     /// Sends `message` as a request with `flags` and returns its sequence.
@@ -696,7 +756,7 @@ const fn nl_mgrp(group: u32) -> u32 {
 #[cfg(test)]
 mod tests {
     use std::{
-        collections::VecDeque,
+        collections::{HashSet, VecDeque},
         net::{Ipv4Addr, Ipv6Addr},
         os::unix::net::UnixDatagram,
         time::Duration,
@@ -704,7 +764,8 @@ mod tests {
 
     use netlink_packet_core::{DefaultNla, DoneMessage, NLM_F_MULTIPART};
     use netlink_packet_route::{
-        link::{LinkFlags, LinkMessage},
+        address::{AddressAttribute, AddressMessage},
+        link::{InfoKind, LinkAttribute, LinkFlags, LinkInfo, LinkMessage},
         route::{RouteNextHop, RouteVia},
     };
 
@@ -838,6 +899,15 @@ mod tests {
         call: impl FnOnce(&mut Handle) -> io::Result<()>,
         error: Option<i32>,
     ) -> (NetlinkMessage<RouteNetlinkMessage>, io::Result<()>) {
+        reply_from_fake_kernel(call, ack_message(0, 0, error).payload)
+    }
+
+    /// The request that `call` makes of a fake kernel that answers it with
+    /// `reply`, and what `call` returns.
+    fn reply_from_fake_kernel<T>(
+        call: impl FnOnce(&mut Handle) -> io::Result<T>,
+        reply: NetlinkPayload<RouteNetlinkMessage>,
+    ) -> (NetlinkMessage<RouteNetlinkMessage>, io::Result<T>) {
         let (client, kernel) = UnixDatagram::pair().unwrap();
         client
             .set_read_timeout(Some(Duration::from_secs(5)))
@@ -847,7 +917,7 @@ mod tests {
             let n = kernel.recv(&mut buf).unwrap();
             let request = parse_nlmsgs(&buf[..n]).unwrap().remove(0);
             let header = request.header;
-            let reply = ack_message(header.sequence_number, header.port_number, error);
+            let reply = message(header.sequence_number, header.port_number, reply);
             kernel.send(&serialize(&[reply])).unwrap();
             request
         });
@@ -915,6 +985,113 @@ mod tests {
         let error = handle.delete_rule(&Rule::v4().iif("")).unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
         assert_eq!(handle.sequence, 0);
+    }
+
+    #[test]
+    fn an_address_is_replaced_where_it_is_and_deleted_by_its_spec() {
+        let address = Address::new(7, IpAddr::V4(Ipv4Addr::new(198, 18, 0, 1)), 32)
+            .peer(IpAddr::V4(Ipv4Addr::new(198, 18, 0, 2)));
+        let message = address::address_message(&address);
+
+        let (request, replaced) =
+            ack_from_fake_kernel(|handle| handle.replace_address(&address), None);
+        replaced.unwrap();
+        assert_eq!(
+            request.header.flags,
+            NLM_F_REQUEST | NLM_F_ACK | NLM_F_CREATE | NLM_F_REPLACE
+        );
+        assert_eq!(
+            request.payload,
+            NetlinkPayload::InnerMessage(RouteNetlinkMessage::NewAddress(message.clone()))
+        );
+
+        let (request, deleted) =
+            ack_from_fake_kernel(|handle| handle.delete_address(&address), None);
+        deleted.unwrap();
+        assert_eq!(request.header.flags, NLM_F_REQUEST | NLM_F_ACK);
+        assert_eq!(
+            request.payload,
+            NetlinkPayload::InnerMessage(RouteNetlinkMessage::DelAddress(message))
+        );
+    }
+
+    #[test]
+    fn deleting_a_missing_address_is_not_found_and_a_missing_interface_the_kernels_error() {
+        let address = Address::new(7, IpAddr::V6(Ipv6Addr::LOCALHOST), 128);
+
+        let (_, missing) = ack_from_fake_kernel(
+            |handle| handle.delete_address(&address),
+            Some(-libc::EADDRNOTAVAIL),
+        );
+        let (_, no_interface) = ack_from_fake_kernel(
+            |handle| handle.delete_address(&address),
+            Some(-libc::ENODEV),
+        );
+
+        assert_eq!(missing.unwrap_err().kind(), io::ErrorKind::NotFound);
+        assert_eq!(no_interface.unwrap_err().raw_os_error(), Some(libc::ENODEV));
+    }
+
+    #[test]
+    fn an_invalid_address_is_not_sent() {
+        let mut handle = Handle {
+            fd: UnixDatagram::pair().unwrap().0.into(),
+            port_id: 42,
+            sequence: 0,
+        };
+        let address = Address::new(7, IpAddr::V4(Ipv4Addr::new(198, 18, 0, 1)), 33);
+
+        let error = handle.replace_address(&address).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        let error = handle.delete_address(&address).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        assert_eq!(handle.sequence, 0);
+    }
+
+    #[test]
+    fn a_link_is_changed_by_its_index() {
+        let (request, set) = ack_from_fake_kernel(|handle| handle.set_link_mtu(7, 1400), None);
+        set.unwrap();
+        assert_eq!(request.header.flags, NLM_F_REQUEST | NLM_F_ACK);
+        assert_eq!(
+            request.payload,
+            NetlinkPayload::InnerMessage(RouteNetlinkMessage::SetLink(link::mtu_message(7, 1400)))
+        );
+
+        let (request, down) = ack_from_fake_kernel(|handle| handle.set_link_up(7, false), None);
+        down.unwrap();
+        assert_eq!(request.header.flags, NLM_F_REQUEST | NLM_F_ACK);
+        assert_eq!(
+            request.payload,
+            NetlinkPayload::InnerMessage(RouteNetlinkMessage::SetLink(link::up_message(7, false)))
+        );
+    }
+
+    #[test]
+    fn the_mtu_of_a_link_is_that_of_the_reply() {
+        let new_link = |link| NetlinkPayload::InnerMessage(RouteNetlinkMessage::NewLink(link));
+
+        let (request, mtu) = reply_from_fake_kernel(
+            |handle| handle.get_link_mtu(7),
+            new_link(link::mtu_message(7, 1400)),
+        );
+        assert_eq!(mtu.unwrap(), 1400);
+        assert_eq!(request.header.flags, NLM_F_REQUEST);
+        assert_eq!(
+            request.payload,
+            NetlinkPayload::InnerMessage(RouteNetlinkMessage::GetLink(link::link_message(7)))
+        );
+
+        let (_, no_mtu) = reply_from_fake_kernel(
+            |handle| handle.get_link_mtu(7),
+            new_link(link::link_message(7)),
+        );
+        assert!(no_mtu.is_err());
+        let (_, no_interface) = reply_from_fake_kernel(
+            |handle| handle.get_link_mtu(7),
+            ack_message(0, 0, Some(-libc::ENODEV)).payload,
+        );
+        assert_eq!(no_interface.unwrap_err().raw_os_error(), Some(libc::ENODEV));
     }
 
     fn default_route(gateway: Ipv4Addr, ifindex: u32, metric: Option<u32>) -> RouteMessage {
@@ -1472,17 +1649,9 @@ mod tests {
                 .spawn_scoped(scope, || {
                     syscall!(unshare(libc::CLONE_NEWNET)).unwrap();
 
-                    let mut lo = LinkMessage::default();
-                    lo.header.index = crate::if_nametoindex("lo").unwrap();
-                    lo.header.flags = LinkFlags::Up;
-                    lo.header.change_mask = LinkFlags::Up;
                     let mut handle = Handle::new().unwrap();
-                    let sequence = handle
-                        .request(NLM_F_ACK, RouteNetlinkMessage::SetLink(lo))
-                        .unwrap();
-                    handle
-                        .replies(sequence, |message| Some(ack(message.payload)))
-                        .unwrap();
+                    let lo = crate::if_nametoindex("lo").unwrap();
+                    handle.set_link_up(lo, true).unwrap();
 
                     test(handle)
                 })
@@ -1763,6 +1932,212 @@ mod tests {
             handle.delete_rule(&rule).unwrap();
             handle.add_rule(&rule.suppress_prefixlength(24)).unwrap();
             assert_eq!(handle.get_route(&destination(1)).unwrap(), main);
+        });
+    }
+
+    /// Adds a dummy interface, down, to the namespace of the test, and
+    /// returns its index.
+    fn add_dummy(handle: &mut Handle, name: &str) -> u32 {
+        let mut dummy = LinkMessage::default();
+        dummy.attributes.push(LinkAttribute::IfName(name.into()));
+        dummy
+            .attributes
+            .push(LinkAttribute::LinkInfo(vec![LinkInfo::Kind(
+                InfoKind::Dummy,
+            )]));
+        handle
+            .change(
+                NLM_F_CREATE | NLM_F_EXCL,
+                RouteNetlinkMessage::NewLink(dummy),
+            )
+            .unwrap();
+
+        crate::if_nametoindex(name).unwrap()
+    }
+
+    /// The addresses the kernel has for the interface `ifindex`, which it
+    /// lists in an order of its own.
+    fn addresses(handle: &mut Handle, ifindex: u32) -> HashSet<Address> {
+        let dump = RouteNetlinkMessage::GetAddress(AddressMessage::default());
+        let sequence = handle.request(NLM_F_DUMP, dump).unwrap();
+        let mut addresses = HashSet::new();
+        handle
+            .replies(sequence, |message| match message.payload {
+                NetlinkPayload::InnerMessage(RouteNetlinkMessage::NewAddress(message)) => {
+                    if message.header.index == ifindex {
+                        addresses.insert(address_from_message(&message));
+                    }
+                    None
+                }
+                NetlinkPayload::Done(_) => Some(Ok(())),
+                payload => Some(Err(unexpected_reply(payload))),
+            })
+            .unwrap();
+
+        addresses
+    }
+
+    /// The kernel reports the peer in IFA_ADDRESS and the address itself in
+    /// IFA_LOCAL, and an IPv6 address without a peer in IFA_ADDRESS alone.
+    fn address_from_message(message: &AddressMessage) -> Address {
+        let attribute = |local| {
+            message.attributes.iter().find_map(|attr| match attr {
+                AddressAttribute::Local(ip) if local => Some(*ip),
+                AddressAttribute::Address(ip) if !local => Some(*ip),
+                _ => None,
+            })
+        };
+        let address = attribute(false).unwrap();
+        let ip = attribute(true).unwrap_or(address);
+
+        Address {
+            ifindex: message.header.index,
+            ip,
+            prefix: message.header.prefix_len,
+            peer: (address != ip).then_some(address),
+        }
+    }
+
+    fn link_is_up(handle: &mut Handle, ifindex: u32) -> bool {
+        let get = RouteNetlinkMessage::GetLink(link::link_message(ifindex));
+        let sequence = handle.request(0, get).unwrap();
+        handle
+            .replies(sequence, |message| {
+                Some(match message.payload {
+                    NetlinkPayload::InnerMessage(RouteNetlinkMessage::NewLink(link)) => {
+                        Ok(link.header.flags.contains(LinkFlags::Up))
+                    }
+                    payload => Err(unexpected_reply(payload)),
+                })
+            })
+            .unwrap()
+    }
+
+    fn assert_not_found(deleted: io::Result<()>) {
+        assert_eq!(deleted.unwrap_err().kind(), io::ErrorKind::NotFound);
+    }
+
+    #[test]
+    #[ignore = "requires root, and changes addresses in a network namespace of its own"]
+    fn ipv4_addresses_round_trip_by_ip_prefix_and_peer() {
+        isolated(|mut handle| {
+            let dummy = add_dummy(&mut handle, "rtx-dummy0");
+            let ip = IpAddr::V4(Ipv4Addr::new(198, 18, 251, 1));
+            let address = Address::new(dummy, ip, 24);
+            let narrower = Address::new(dummy, ip, 25);
+            let peer = IpAddr::V4(Ipv4Addr::new(198, 18, 250, 2));
+            let to_peer = Address::new(dummy, ip, 32).peer(peer);
+
+            assert_not_found(handle.delete_address(&address));
+            handle.replace_address(&address).unwrap();
+            handle.replace_address(&address).unwrap();
+            assert_eq!(addresses(&mut handle, dummy), HashSet::from([address]));
+
+            // Another prefix or peer makes another address of the same ip.
+            handle.replace_address(&narrower).unwrap();
+            handle.replace_address(&to_peer).unwrap();
+            handle.replace_address(&to_peer).unwrap();
+            assert_eq!(
+                addresses(&mut handle, dummy),
+                HashSet::from([address, narrower, to_peer])
+            );
+
+            // Each is deleted by its own prefix and peer.
+            let other_peer = to_peer.peer(IpAddr::V4(Ipv4Addr::new(198, 18, 250, 3)));
+            assert_not_found(handle.delete_address(&other_peer));
+            assert_not_found(handle.delete_address(&Address::new(dummy, ip, 26)));
+            handle.delete_address(&narrower).unwrap();
+            handle.delete_address(&to_peer).unwrap();
+            assert_eq!(addresses(&mut handle, dummy), HashSet::from([address]));
+            handle.delete_address(&address).unwrap();
+            assert_not_found(handle.delete_address(&address));
+            assert_eq!(addresses(&mut handle, dummy), HashSet::new());
+        });
+    }
+
+    #[test]
+    #[ignore = "requires root, and changes addresses in a network namespace of its own"]
+    fn an_interface_has_an_ipv6_address_once() {
+        isolated(|mut handle| {
+            let dummy = add_dummy(&mut handle, "rtx-dummy0");
+            let ip = IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0xfb, 0, 0, 0, 0, 1));
+            let address = Address::new(dummy, ip, 64);
+            let host = Address::new(
+                dummy,
+                IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0xfb, 1, 0, 0, 0, 1)),
+                128,
+            );
+            let peer = IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0xfb, 1, 0, 0, 0, 2));
+
+            assert_not_found(handle.delete_address(&address));
+            handle.replace_address(&address).unwrap();
+            handle.replace_address(&address).unwrap();
+            assert_eq!(addresses(&mut handle, dummy), HashSet::from([address]));
+
+            // The kernel leaves the prefix of the one that is there, and
+            // deletes it by that prefix alone.
+            handle
+                .replace_address(&Address::new(dummy, ip, 48))
+                .unwrap();
+            assert_eq!(addresses(&mut handle, dummy), HashSet::from([address]));
+            assert_not_found(handle.delete_address(&Address::new(dummy, ip, 48)));
+
+            // It changes the peer of the one that is there.
+            handle.replace_address(&host).unwrap();
+            handle.replace_address(&host.peer(peer)).unwrap();
+            assert_eq!(
+                addresses(&mut handle, dummy),
+                HashSet::from([address, host.peer(peer)])
+            );
+
+            handle.delete_address(&host).unwrap();
+            handle.delete_address(&address).unwrap();
+            assert_not_found(handle.delete_address(&address));
+            assert_eq!(addresses(&mut handle, dummy), HashSet::new());
+        });
+    }
+
+    #[test]
+    #[ignore = "requires root, and changes a link in a network namespace of its own"]
+    fn a_link_takes_an_mtu_and_goes_up_and_down() {
+        isolated(|mut handle| {
+            let dummy = add_dummy(&mut handle, "rtx-dummy0");
+            assert!(!link_is_up(&mut handle, dummy));
+
+            handle.set_link_mtu(dummy, 1400).unwrap();
+            assert_eq!(handle.get_link_mtu(dummy).unwrap(), 1400);
+            assert!(!link_is_up(&mut handle, dummy));
+
+            handle.set_link_up(dummy, true).unwrap();
+            handle.set_link_up(dummy, true).unwrap();
+            assert!(link_is_up(&mut handle, dummy));
+            assert_eq!(handle.get_link_mtu(dummy).unwrap(), 1400);
+
+            handle.set_link_mtu(dummy, 1280).unwrap();
+            assert_eq!(handle.get_link_mtu(dummy).unwrap(), 1280);
+            assert!(link_is_up(&mut handle, dummy));
+
+            handle.set_link_up(dummy, false).unwrap();
+            assert!(!link_is_up(&mut handle, dummy));
+        });
+    }
+
+    #[test]
+    #[ignore = "requires root to make a network namespace"]
+    fn an_interface_that_is_not_there_is_the_kernels_error() {
+        isolated(|mut handle| {
+            let missing = 4242;
+            let address = Address::new(missing, IpAddr::V4(Ipv4Addr::new(198, 18, 251, 1)), 24);
+
+            for result in [
+                handle.replace_address(&address),
+                handle.delete_address(&address),
+                handle.set_link_mtu(missing, 1400),
+                handle.set_link_up(missing, true),
+                handle.get_link_mtu(missing).map(drop),
+            ] {
+                assert_eq!(result.unwrap_err().raw_os_error(), Some(libc::ENODEV));
+            }
         });
     }
 }

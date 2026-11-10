@@ -18,6 +18,7 @@ macro_rules! syscall {
     }};
 }
 
+mod address;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 mod fd;
 #[cfg(target_os = "linux")]
@@ -29,6 +30,7 @@ mod rule;
 #[cfg(target_os = "windows")]
 mod windows;
 
+pub use address::Address;
 #[cfg(target_os = "linux")]
 pub use linux::{Handle, RouteMonitor};
 #[cfg(target_os = "macos")]
@@ -54,6 +56,18 @@ pub const TABLE_DEFAULT: u32 = 253;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 fn missing_route(error: io::Error) -> io::Error {
     if error.raw_os_error() == Some(libc::ESRCH) {
+        io::Error::new(io::ErrorKind::NotFound, error)
+    } else {
+        error
+    }
+}
+
+/// Linux and macOS fail to delete an address that is not there with
+/// `EADDRNOTAVAIL`, which is `NotFound` here, as on Windows, with the
+/// kernel's error as its source.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn missing_address(error: io::Error) -> io::Error {
+    if error.raw_os_error() == Some(libc::EADDRNOTAVAIL) {
         io::Error::new(io::ErrorKind::NotFound, error)
     } else {
         error
@@ -294,6 +308,18 @@ mod tests {
 
         let other = missing_route(io::Error::from_raw_os_error(libc::EPERM));
         assert_eq!(other.raw_os_error(), Some(libc::EPERM));
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn a_missing_address_is_not_found_with_the_kernel_error_as_its_source() {
+        let error = missing_address(io::Error::from_raw_os_error(libc::EADDRNOTAVAIL));
+        assert_eq!(error.kind(), io::ErrorKind::NotFound);
+        let source = error.get_ref().unwrap().downcast_ref::<io::Error>();
+        assert_eq!(source.unwrap().raw_os_error(), Some(libc::EADDRNOTAVAIL));
+
+        let other = missing_address(io::Error::from_raw_os_error(libc::ENODEV));
+        assert_eq!(other.raw_os_error(), Some(libc::ENODEV));
     }
 
     #[test]
