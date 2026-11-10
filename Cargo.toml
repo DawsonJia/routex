@@ -7,7 +7,7 @@ rust-version = "1.88"
 license = "MIT"
 authors = ["dawson a957360688@gmail.com"]
 repository = "https://github.com/Dawson-Jones/routex"
-description = "Add, delete, look up and monitor IP routes on Linux, macOS and Windows, and policy routing rules on Linux"
+description = "IP routes, interface addresses and link MTU on Linux, macOS and Windows, and policy routing rules on Linux"
 # Apple's route(8) sources, kept as a reference under their own license.
 exclude = ["reference/"]
 
