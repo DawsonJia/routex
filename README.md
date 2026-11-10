@@ -197,7 +197,9 @@ fn main() {}
 - What is there already is the platform's to say. On macOS and Windows an
   interface has an `ip` once: `replace_address` changes the prefix, and on
   macOS the peer, of the one that is there, and `delete_address` deletes it
-  by its `ip` alone. On Linux an IPv4 address is its `ip`, `prefix` and
+  by its `ip` alone. macOS changes neither of an IPv6 address: one that is
+  there as asked is left as it is, and any other deleted and added again. On
+  Linux an IPv4 address is its `ip`, `prefix` and
   `peer`: with another prefix or peer it is another address, which
   `replace_address` adds beside the first, and each is deleted by its own.
   On Linux an interface has an IPv6 `ip` once as well, but the kernel only
@@ -207,19 +209,20 @@ fn main() {}
 - An `Address::peer` is the other end of a point-to-point link; the address
   then brings a route to the peer, not to its prefix. Linux takes a peer on
   any interface. macOS takes one on a point-to-point interface, such as a
-  `utun`, and with an IPv6 address only under prefix 128; a peer of an IPv4
-  address on another interface fails with `io::ErrorKind::InvalidInput`, as
-  the kernel would take it for the broadcast address.
+  `utun`, and with an IPv6 address only under prefix 128; any other fails
+  with `io::ErrorKind::InvalidInput`, as the kernel would take the peer of an
+  IPv4 address on a broadcast interface for the broadcast address.
 - On a point-to-point interface of macOS, an IPv4 address without a peer is
   the first IPv4 address of the interface or none: the kernel sets it over
   the first one, whatever that is. `replace_address` asks the kernel for the
   first address, and fails with `io::ErrorKind::InvalidInput`, changing
   nothing, where the address would take the place of another, or keep the
   peer the address has. A caller sets the address without a peer before
-  those with one; `routex` keeps no state of its own.
-- macOS has no IPv4 prefix 0: `replace_address` fails with
+  those with one; `routex` keeps no state of its own. Such an address brings
+  no route: a caller adds the one to its prefix.
+- macOS has no prefix 0: an address with one fails with
   `io::ErrorKind::InvalidInput`, as the kernel would use the mask of the
-  class of the address instead.
+  class of an IPv4 address instead.
 - `set_link_mtu` leaves the MTUs an interface does not take to the kernel to
   refuse. On Windows IPv4 and IPv6 each have an MTU of the interface:
   `set_link_mtu` sets both, and `get_link_mtu` reads that of IPv4, or of IPv6

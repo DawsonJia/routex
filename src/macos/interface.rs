@@ -45,6 +45,11 @@ type IfName = [c_char; IFNAMSIZ];
 /// `ND6_INFINITE_LIFETIME`: the address never expires.
 const INFINITE_LIFETIME: u32 = u32::MAX;
 
+/// The `IN6_IFF_*` flags of `netinet6/in6_var.h` for an address that the
+/// system gave the interface and may take back: one that was autoconfigured,
+/// is temporary, or came by DHCPv6.
+const IN6_IFF_NOT_BY_HAND: c_int = 0x40 | 0x80 | 0x100;
+
 /// An ioctl of the `'i'` group that takes a `T`, encoded as `_IOW` and
 /// `_IOWR` of `sys/ioccom.h` do: the kernel copies as many bytes as the
 /// request says, so a request goes with its one argument type.
@@ -84,6 +89,8 @@ const SIOCDIFADDR_IN6: Request<in6_ifreq> = Request::write(25);
 const SIOCAIFADDR_IN6: Request<In6AliasReq> = Request::write(26);
 const SIOCGIFDSTADDR_IN6: Request<in6_ifreq> = Request::read_write(34);
 const SIOCGIFNETMASK_IN6: Request<in6_ifreq> = Request::read_write(37);
+const SIOCGIFAFLAG_IN6: Request<in6_ifreq> = Request::read_write(73);
+const SIOCGIFALIFETIME_IN6: Request<in6_ifreq> = Request::read_write(81);
 
 fn ioctl<T>(socket: BorrowedFd<'_>, request: Request<T>, argument: &mut T) -> io::Result<()> {
     syscall!(ioctl(socket.as_raw_fd(), request.0, argument as *mut T))?;
@@ -128,9 +135,43 @@ fn in6_request(name: IfName, ip: Ipv6Addr) -> in6_ifreq {
 
 pub(super) fn replace_address(address: &Address) -> io::Result<()> {
     let name = name(address.ifindex)?;
+    let socket = socket(match address.ip {
+        IpAddr::V4(_) => AF_INET,
+        IpAddr::V6(_) => AF_INET6,
+    })?;
+    let socket = socket.as_fd();
+    let point_to_point = flags(socket, &mut if_request(name))? & IFF_POINTOPOINT as c_short != 0;
+    // XNU takes the peer of an IPv4 address for the broadcast address of a
+    // broadcast interface, and drops it on any other. It refuses that of an
+    // IPv6 address, but on a loopback interface, where no request reads it
+    // back.
+    if let Some(peer) = address.peer
+        && !point_to_point
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("peer {peer} on an interface that is not point-to-point"),
+        ));
+    }
+
     match address.ip {
-        IpAddr::V4(ip) => replace_v4(name, ip, address.prefix, address.peer.and_then(v4)),
-        IpAddr::V6(ip) => replace_v6(name, ip, address.prefix, address.peer.and_then(v6)),
+        // SIOCAIFADDR fails an address of a point-to-point interface that
+        // has no peer with EDESTADDRREQ.
+        IpAddr::V4(ip) if point_to_point && address.peer.is_none() => {
+            set_peerless(socket, name, ip, address.prefix)
+        }
+        // Adds the address, or changes the prefix and peer of the one that
+        // is there.
+        IpAddr::V4(ip) => {
+            let mut request = IfAliasReq {
+                name,
+                addr: in_sockaddr_in(ip),
+                dstaddr: (address.peer.and_then(v4)).map_or(unsafe { zeroed() }, in_sockaddr_in),
+                mask: in_sockaddr_in(v4_netmask(address.prefix)),
+            };
+            ioctl(socket, SIOCAIFADDR, &mut request)
+        }
+        IpAddr::V6(ip) => replace_v6(socket, name, ip, address.prefix, address.peer.and_then(v6)),
     }
 }
 
@@ -153,8 +194,8 @@ pub(super) fn delete_address(address: &Address) -> io::Result<()> {
 
 pub(super) fn set_mtu(ifindex: u32, mtu: u32) -> io::Result<()> {
     let mut request = if_request(name(ifindex)?);
-    // The kernel reads it back as the unsigned number it is, and refuses
-    // the MTUs it does not take.
+    // An MTU above `i32::MAX` is a negative one to the kernel, which
+    // refuses it as it does every MTU it does not take.
     request.ifr_ifru.ifru_mtu = mtu as c_int;
 
     ioctl(socket(AF_INET)?.as_fd(), SIOCSIFMTU, &mut request)
@@ -185,34 +226,6 @@ fn flags(socket: BorrowedFd<'_>, request: &mut ifreq) -> io::Result<c_short> {
     ioctl(socket, SIOCGIFFLAGS, request)?;
 
     Ok(unsafe { request.ifr_ifru.ifru_flags })
-}
-
-fn replace_v4(name: IfName, ip: Ipv4Addr, prefix: u8, peer: Option<Ipv4Addr>) -> io::Result<()> {
-    let socket = socket(AF_INET)?;
-    let point_to_point =
-        flags(socket.as_fd(), &mut if_request(name))? & IFF_POINTOPOINT as c_short != 0;
-    match (peer, point_to_point) {
-        // SIOCAIFADDR fails an address of a point-to-point interface that
-        // has no peer with EDESTADDRREQ.
-        (None, true) => set_peerless(socket.as_fd(), name, ip, prefix),
-        // XNU takes the peer for the broadcast address of a broadcast
-        // interface, and drops it on any other.
-        (Some(peer), false) => Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            format!("peer {peer} on an interface that is not point-to-point"),
-        )),
-        // Adds the address, or changes the prefix and peer of the one that
-        // is there.
-        (peer, _) => {
-            let mut request = IfAliasReq {
-                name,
-                addr: in_sockaddr_in(ip),
-                dstaddr: peer.map_or(unsafe { zeroed() }, in_sockaddr_in),
-                mask: in_sockaddr_in(v4_netmask(prefix)),
-            };
-            ioctl(socket.as_fd(), SIOCAIFADDR, &mut request)
-        }
-    }
 }
 
 /// Sets `ip/prefix` as the address without a peer of a point-to-point
@@ -256,9 +269,19 @@ fn set_peerless(socket: BorrowedFd<'_>, name: IfName, ip: Ipv4Addr, prefix: u8) 
     ioctl(socket, SIOCSIFADDR, &mut address)
 }
 
-fn replace_v6(name: IfName, ip: Ipv6Addr, prefix: u8, peer: Option<Ipv6Addr>) -> io::Result<()> {
-    let socket = socket(AF_INET6)?;
-    let add = |(prefix, peer): (u8, Option<Ipv6Addr>)| {
+/// What an IPv6 address is to `replace_address`: its prefix, its peer, and
+/// whether it was set by hand, for good.
+type V6State = (u8, Option<Ipv6Addr>, bool);
+
+fn replace_v6(
+    socket: BorrowedFd<'_>,
+    name: IfName,
+    ip: Ipv6Addr,
+    prefix: u8,
+    peer: Option<Ipv6Addr>,
+) -> io::Result<()> {
+    let delete = || ioctl(socket, SIOCDIFADDR_IN6, &mut in6_request(name, ip));
+    let add = |prefix, peer: Option<Ipv6Addr>| {
         let mut request = In6AliasReq {
             name,
             addr: in6_sockaddr(ip),
@@ -273,54 +296,78 @@ fn replace_v6(name: IfName, ip: Ipv6Addr, prefix: u8, peer: Option<Ipv6Addr>) ->
                 ia6t_pltime: INFINITE_LIFETIME,
             },
         };
-        ioctl(socket.as_fd(), SIOCAIFADDR_IN6, &mut request)
+        ioctl(socket, SIOCAIFADDR_IN6, &mut request)
     };
 
-    match v6_prefix_and_peer(socket.as_fd(), name, ip)? {
-        // XNU gives an address its prefix and peer when it adds it, and
-        // changes neither after: one that is there with another goes first,
-        // and comes back if the kernel refuses the new one.
-        Some(current) if current != (prefix, peer) => {
-            ioctl(socket.as_fd(), SIOCDIFADDR_IN6, &mut in6_request(name, ip))?;
-            add((prefix, peer)).inspect_err(|_| {
-                let _ = add(current);
-            })
-        }
-        _ => add((prefix, peer)),
+    // XNU gives an address its prefix and peer when it adds it and changes
+    // neither after, and joins the multicast groups of an address anew each
+    // time it is set: one that is as asked stays as it is, and any other
+    // goes first.
+    let current = v6_state(socket, name, ip)?;
+    match current {
+        Some(current) if current == (prefix, peer, true) => return Ok(()),
+        Some(_) => delete()?,
+        None => {}
     }
+    add(prefix, peer).inspect_err(|_| {
+        // XNU may leave an address it fails to add on the interface, without
+        // its route. The interface gets back the address it had, set by
+        // hand.
+        let _ = delete();
+        if let Some((prefix, peer, _)) = current {
+            let _ = add(prefix, peer);
+        }
+    })
 }
 
-/// The prefix and peer of the address `ip` of the interface `name`, if the
-/// interface has it.
-fn v6_prefix_and_peer(
-    socket: BorrowedFd<'_>,
-    name: IfName,
-    ip: Ipv6Addr,
-) -> io::Result<Option<(u8, Option<Ipv6Addr>)>> {
-    let mut netmask = in6_request(name, ip);
-    match ioctl(socket, SIOCGIFNETMASK_IN6, &mut netmask) {
-        Err(error) if error.raw_os_error() == Some(EADDRNOTAVAIL) => return Ok(None),
-        result => result?,
-    }
-    let netmask = unsafe { netmask.ifr_ifru.ifru_addr }.sin6_addr.s6_addr;
-    let prefix = prefix_len(IpAddr::V6(Ipv6Addr::from(netmask)));
+/// What the address `ip` of the interface `name` is, if the interface has
+/// it.
+fn v6_state(socket: BorrowedFd<'_>, name: IfName, ip: Ipv6Addr) -> io::Result<Option<V6State>> {
+    // What the kernel has for the address, or none once it is not there.
+    let get = |request| {
+        let mut argument = in6_request(name, ip);
+        match ioctl(socket, request, &mut argument) {
+            Ok(()) => Ok(Some(argument.ifr_ifru)),
+            Err(error) if error.raw_os_error() == Some(EADDRNOTAVAIL) => Ok(None),
+            Err(error) => Err(error),
+        }
+    };
 
-    let mut peer = in6_request(name, ip);
-    let peer = match ioctl(socket, SIOCGIFDSTADDR_IN6, &mut peer) {
-        // TODO: only a point-to-point interface answers. A loopback one can
-        // give an address a peer too, which only getifaddrs reports, and
-        // which is taken for none here.
+    let Some(netmask) = get(SIOCGIFNETMASK_IN6)? else {
+        return Ok(None);
+    };
+    let Some(flags) = get(SIOCGIFAFLAG_IN6)? else {
+        return Ok(None);
+    };
+    let Some(lifetime) = get(SIOCGIFALIFETIME_IN6)? else {
+        return Ok(None);
+    };
+    let peer = match get(SIOCGIFDSTADDR_IN6) {
+        // TODO: only a point-to-point interface answers. An address of a
+        // loopback one may have a peer too, which only getifaddrs reports,
+        // and which is taken for none here.
         Err(error) if error.raw_os_error() == Some(EINVAL) => None,
         Err(error) => return Err(error),
+        Ok(None) => return Ok(None),
         // No peer is a sockaddr of no family.
-        Ok(()) => {
-            let peer = unsafe { peer.ifr_ifru.ifru_dstaddr };
+        Ok(Some(peer)) => {
+            let peer = unsafe { peer.ifru_dstaddr };
             (c_int::from(peer.sin6_family) == AF_INET6)
                 .then(|| Ipv6Addr::from(peer.sin6_addr.s6_addr))
         }
     };
 
-    Ok(Some((prefix, peer)))
+    let netmask = unsafe { netmask.ifru_addr }.sin6_addr.s6_addr;
+    let lifetime = unsafe { lifetime.ifru_lifetime };
+    let by_hand_for_good = unsafe { flags.ifru_flags6 } & IN6_IFF_NOT_BY_HAND == 0
+        && lifetime.ia6t_vltime == INFINITE_LIFETIME
+        && lifetime.ia6t_pltime == INFINITE_LIFETIME;
+
+    Ok(Some((
+        prefix_len(IpAddr::V6(Ipv6Addr::from(netmask))),
+        peer,
+        by_hand_for_good,
+    )))
 }
 
 /// `ip` if it is an IPv4 address; `Address::validate` leaves a peer of the
@@ -393,6 +440,8 @@ mod tests {
         assert_eq!(SIOCAIFADDR_IN6.0, 0x8080_691a);
         assert_eq!(SIOCGIFDSTADDR_IN6.0, 0xc120_6922);
         assert_eq!(SIOCGIFNETMASK_IN6.0, 0xc120_6925);
+        assert_eq!(SIOCGIFAFLAG_IN6.0, 0xc120_6949);
+        assert_eq!(SIOCGIFALIFETIME_IN6.0, 0xc120_6951);
     }
 
     #[test]
@@ -466,6 +515,26 @@ mod tests {
         assert_kind(
             replace_address(&address.peer(peer)),
             io::ErrorKind::InvalidInput,
+        );
+        let address = v6_address(lo0(), [1, 1], 128);
+        let peer = IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0xfb, 1, 0, 0, 0, 2));
+        assert_kind(
+            replace_address(&address.peer(peer)),
+            io::ErrorKind::InvalidInput,
+        );
+    }
+
+    #[test]
+    #[ignore = "black-box check against the live macOS interfaces"]
+    fn the_state_of_an_ipv6_address_is_read_without_root() {
+        let socket = socket(AF_INET6).unwrap();
+        let name = name(lo0()).unwrap();
+        let state = |ip| v6_state(socket.as_fd(), name, ip).unwrap();
+
+        assert_eq!(state(Ipv6Addr::LOCALHOST), Some((128, None, true)));
+        assert_eq!(
+            state(Ipv6Addr::new(0x2001, 0xdb8, 0xfb, 0, 0, 0, 0, 1)),
+            None
         );
     }
 
@@ -709,6 +778,33 @@ mod tests {
         delete_address(&wider).unwrap();
         assert_kind(delete_address(&wider), io::ErrorKind::NotFound);
         assert_eq!(addresses(utun.index), HashSet::new());
+    }
+
+    #[test]
+    #[ignore = "requires root, and configures a utun interface of its own"]
+    fn an_ipv6_address_the_kernel_fails_to_add_leaves_what_was_there() {
+        let utun = utun();
+        let peer = |last| IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0xfb, 1, 0, 0, 0, last));
+        let first = v6_address(utun.index, [1, 1], 128).peer(peer(9));
+        let second = v6_address(utun.index, [1, 2], 128);
+        replace_address(&first).unwrap();
+
+        // The kernel has one route to a peer, and may fail a second address
+        // to it: then the address is not there, or is there as it was.
+        let added = replace_address(&second.peer(peer(9)));
+        let after = match added {
+            Ok(()) => HashSet::from([first, second.peer(peer(9))]),
+            Err(_) => HashSet::from([first]),
+        };
+        assert_eq!(addresses(utun.index), after, "{added:?}");
+
+        replace_address(&second.peer(peer(8))).unwrap();
+        let changed = replace_address(&second.peer(peer(9)));
+        let after = match changed {
+            Ok(()) => HashSet::from([first, second.peer(peer(9))]),
+            Err(_) => HashSet::from([first, second.peer(peer(8))]),
+        };
+        assert_eq!(addresses(utun.index), after, "{changed:?}");
     }
 
     #[test]

@@ -51,11 +51,20 @@ impl Address {
             return invalid(format!("peer {peer} does not match address {}", self.ip));
         }
 
-        // XNU takes a netmask of 0 for none, and gives the address the mask
-        // of its class instead.
         #[cfg(target_os = "macos")]
-        if self.ip.is_ipv4() && self.prefix == 0 {
-            return invalid(format!("macOS has no IPv4 prefix 0 for {}", self.ip));
+        {
+            // XNU refuses an IPv6 prefix of 0. It takes an IPv4 netmask of 0
+            // for none, and gives the address the mask of its class instead.
+            if self.prefix == 0 {
+                return invalid(format!("macOS has no prefix 0 for {}", self.ip));
+            }
+            // XNU refuses the peer of an IPv6 address under any other prefix.
+            if self.ip.is_ipv6() && self.peer.is_some() && self.prefix != 128 {
+                return invalid(format!(
+                    "macOS takes the peer of {} under prefix 128 only",
+                    self.ip
+                ));
+            }
         }
 
         Ok(())
@@ -100,11 +109,25 @@ mod tests {
     }
 
     #[test]
-    fn an_ipv4_prefix_of_0_is_invalid_where_the_kernel_takes_it_for_none() {
-        let address = Address::new(7, IpAddr::V4(Ipv4Addr::new(198, 18, 0, 1)), 0);
-
-        assert_eq!(address.validate().is_err(), cfg!(target_os = "macos"));
+    fn a_prefix_of_0_is_invalid_on_macos() {
+        let v4 = IpAddr::V4(Ipv4Addr::new(198, 18, 0, 1));
         let v6 = IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1));
-        assert!(Address::new(7, v6, 0).validate().is_ok());
+
+        for ip in [v4, v6] {
+            let address = Address::new(7, ip, 0);
+            assert_eq!(address.validate().is_err(), cfg!(target_os = "macos"));
+        }
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn the_peer_of_an_ipv6_address_takes_a_host_prefix_on_macos() {
+        let v4 = IpAddr::V4(Ipv4Addr::new(198, 18, 0, 1));
+        let v6 = IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1));
+        let to_peer = Address::new(7, v6, 64).peer(v6);
+
+        assert_eq!(to_peer.validate().is_err(), cfg!(target_os = "macos"));
+        assert!(Address::new(7, v6, 128).peer(v6).validate().is_ok());
+        assert!(Address::new(7, v4, 24).peer(v4).validate().is_ok());
     }
 }
