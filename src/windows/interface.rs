@@ -22,33 +22,46 @@ use crate::Address;
 const INFINITE_LIFETIME: u32 = u32::MAX;
 
 pub(super) fn replace_address(address: &Address) -> io::Result<()> {
-    loop {
-        let mut row = address_row(address);
-        match win32_result(unsafe { GetUnicastIpAddressEntry(&mut row) }) {
-            // The interface has the ip, as an adapter that is opened again
-            // has the addresses of its last use: the row takes the new
-            // prefix, and keeps the rest of what the system has for it.
-            Ok(()) => {
-                set_manual(&mut row, address.prefix);
-                return win32_result(unsafe { SetUnicastIpAddressEntry(&row) });
-            }
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                let mut row = address_row(address);
-                set_manual(&mut row, address.prefix);
-                // In use at once, while the system looks for a duplicate.
-                // TODO: an address that turns out to be a duplicate is
-                // reported nowhere.
-                row.DadState = IpDadStatePreferred;
-                match win32_result(unsafe { CreateUnicastIpAddressEntry(&row) }) {
-                    // Another caller added the ip in between: the row that
-                    // is there now takes the prefix of this one.
-                    Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
-                    result => return result,
-                }
-            }
-            Err(error) => return Err(error),
-        }
+    if set_address(address)? {
+        return Ok(());
     }
+
+    let mut row = address_row(address);
+    set_manual(&mut row, address.prefix);
+    // In use at once, while the system looks for a duplicate.
+    // TODO: an address that turns out to be a duplicate is reported nowhere.
+    row.DadState = IpDadStatePreferred;
+    match win32_result(unsafe { CreateUnicastIpAddressEntry(&row) }) {
+        // Another caller added the ip in between, and its row takes the
+        // prefix. Windows says the same of an ip that another interface
+        // has still, which wireguard-windows takes off the interfaces that
+        // are not connected: there is then no row to set, and the error
+        // stands.
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+            if set_address(address)? {
+                Ok(())
+            } else {
+                Err(error)
+            }
+        }
+        result => result,
+    }
+}
+
+/// Gives the row of `address.ip` the prefix of `address`, if its interface
+/// has the ip, as an adapter that is opened again has the addresses of its
+/// last use: the row keeps the rest of what the system has for it.
+fn set_address(address: &Address) -> io::Result<bool> {
+    let mut row = address_row(address);
+    match win32_result(unsafe { GetUnicastIpAddressEntry(&mut row) }) {
+        Ok(()) => {}
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error),
+    }
+    set_manual(&mut row, address.prefix);
+    win32_result(unsafe { SetUnicastIpAddressEntry(&row) })?;
+
+    Ok(true)
 }
 
 pub(super) fn delete_address(address: &Address) -> io::Result<()> {
