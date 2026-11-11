@@ -23,7 +23,9 @@ fn main() -> Result<(), Box<dyn Error>> {
     match command.as_str() {
         "show" => println!("{name}: mtu {}", handle.get_link_mtu(ifindex)?),
         "set" => {
-            // The whole command is read before any of it changes the link.
+            // The whole command is read before any of it changes the link,
+            // and the MTU is set first wherever it is in the command, as the
+            // kernel sets it for `ip link set`.
             let mut mtu = None;
             let mut up = None;
             while let Some(key) = args.next() {
