@@ -10,9 +10,9 @@ use std::{
 };
 
 use libc::{
-    AF_INET, AF_INET6, AF_LINK, AF_ROUTE, AF_UNSPEC, F_SETFD, FD_CLOEXEC, RTA_DST, RTA_GATEWAY,
-    RTA_IFP, RTA_NETMASK, RTF_GATEWAY, RTF_HOST, RTF_STATIC, RTF_UP, RTM_ADD, RTM_CHANGE,
-    RTM_DELETE, RTM_GET, SHUT_RD, SOCK_RAW,
+    AF_INET, AF_INET6, AF_LINK, AF_ROUTE, AF_UNSPEC, ESRCH, F_SETFD, FD_CLOEXEC, RTA_DST,
+    RTA_GATEWAY, RTA_IFP, RTA_NETMASK, RTF_GATEWAY, RTF_HOST, RTF_STATIC, RTF_UP, RTF_WASCLONED,
+    RTM_ADD, RTM_CHANGE, RTM_DELETE, RTM_GET, SHUT_RD, SOCK_RAW,
 };
 
 use crate::{Address, Route, RouteChange, fd, missing_route};
@@ -96,7 +96,7 @@ impl Handle {
         let seq = next_sequence();
         fd::send(socket.as_fd(), &request(route, RTM_GET, seq))?;
 
-        read_reply(socket.as_fd(), seq)
+        read_reply(socket.as_fd(), seq, read_route)
     }
 
     /// Makes `address` an address of its interface, whether or not it is
@@ -107,12 +107,18 @@ impl Handle {
     /// lifetime, and this fails with `AlreadyExists` if it is not, for a
     /// caller to delete it first.
     ///
-    /// A peer takes a point-to-point interface, such as a `utun`. There, an
-    /// IPv4 address without a peer is the first IPv4 address of the
-    /// interface or none, and brings no route. This changes nothing where
-    /// it would take the place of another address, and fails with
-    /// `InvalidInput`, or where the address is there with a peer, which the
-    /// kernel would leave it, and fails with `AlreadyExists`.
+    /// A peer takes a point-to-point interface, such as a `utun`. The peer
+    /// of an IPv6 address is one that no route is there to: this fails with
+    /// `AlreadyExists` where the routing table has a route to the peer
+    /// alone, as the kernel would fail the address after it has put it on
+    /// the interface.
+    ///
+    /// On a point-to-point interface, an IPv4 address without a peer is the
+    /// first IPv4 address of the interface or none, and brings no route.
+    /// This changes nothing where it would take the place of another
+    /// address, and fails with `InvalidInput`, or where the address is
+    /// there with a peer, which the kernel would leave it, and fails with
+    /// `AlreadyExists`.
     pub fn replace_address(&mut self, address: &Address) -> io::Result<()> {
         address.validate()?;
 
@@ -250,7 +256,37 @@ fn request(route: &Route, rtm_type: i32, seq: i32) -> Vec<u8> {
     message.finish(rtm_type, flags, index, seq)
 }
 
-fn read_reply(fd: BorrowedFd<'_>, seq: i32) -> io::Result<Route> {
+/// Whether the routing table has an entry of its own for the host `ip`: one
+/// in no scope, which the kernel did not clone from another entry. The
+/// kernel adds no route to `ip` where there is one, and replaces a clone.
+fn has_host_route(ip: Ipv6Addr) -> io::Result<bool> {
+    let ip = IpAddr::V6(ip);
+    let socket = open()?;
+    let seq = next_sequence();
+    match fd::send(socket.as_fd(), &request(&Route::new(ip, 128), RTM_GET, seq)) {
+        Ok(()) => {}
+        // The kernel routes `ip` by no entry at all.
+        Err(error) if error.raw_os_error() == Some(ESRCH) => return Ok(false),
+        Err(error) => return Err(error),
+    }
+
+    // The entry the kernel routes `ip` by is the one for `ip` alone, if
+    // there is one.
+    // TODO: the kernel answers with a clone in the scope of the interface
+    // of that entry instead, if it has one, and it looks for a link-local
+    // `ip` in no scope, where its entry is in the scope of an interface.
+    read_reply(socket.as_fd(), seq, |reply| {
+        let own = reply.hdr.rtm_flags & (RTF_HOST | RTF_WASCLONED | RTF_IFSCOPE) == RTF_HOST;
+        Ok(own && read_route(reply)?.destination == ip)
+    })
+}
+
+/// What `read` makes of the reply to the request `seq`.
+fn read_reply<T>(
+    fd: BorrowedFd<'_>,
+    seq: i32,
+    read: impl FnOnce(&Message<'_>) -> io::Result<T>,
+) -> io::Result<T> {
     let pid = std::process::id() as i32;
     let deadline = Instant::now() + REPLY_TIMEOUT;
     let mut buf = [0; MESSAGE_CAPACITY];
@@ -271,7 +307,7 @@ fn read_reply(fd: BorrowedFd<'_>, seq: i32) -> io::Result<Route> {
             return Err(io::Error::from_raw_os_error(reply.hdr.rtm_errno));
         }
 
-        return read_route(&reply);
+        return read(&reply);
     }
 }
 

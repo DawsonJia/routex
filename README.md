@@ -217,9 +217,14 @@ fn main() {}
   any interface. macOS takes one on a point-to-point interface, such as a
   `utun`, and with an IPv6 address only under prefix 128; any other fails
   with `io::ErrorKind::InvalidInput`, as the kernel would take the peer of an
-  IPv4 address on a broadcast interface for the broadcast address. macOS has
-  one IPv6 address to a peer: the kernel fails a second with `EEXIST`, as the
-  route to the peer is there, and `replace_address` leaves nothing of it.
+  IPv4 address on a broadcast interface for the broadcast address. On macOS
+  an IPv6 address takes a peer that no route is there to: `replace_address`
+  fails with `io::ErrorKind::AlreadyExists`, and asks the kernel for nothing,
+  where the routing table has a route to the peer alone, as it has for a
+  second address to one peer, and for the same address and peer on a second
+  interface. The kernel would put the address on the interface and then fail
+  it, and what it leaves takes the route of the same `ip` of another
+  interface with it when it goes.
 - On a point-to-point interface of macOS, an IPv4 address without a peer is
   the first IPv4 address of the interface or none: the kernel sets it over
   the first one, whatever that is, and leaves it its peer. `replace_address`

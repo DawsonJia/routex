@@ -15,7 +15,7 @@ use libc::{
     sockaddr_in, sockaddr_in6,
 };
 
-use super::{prefix_len, v4_netmask, v6_netmask};
+use super::{has_host_route, prefix_len, v4_netmask, v6_netmask};
 use crate::{Address, missing_address};
 
 /// `struct ifaliasreq` of `net/if.h`, which `libc` leaves out. Its second
@@ -296,6 +296,19 @@ fn replace_v6(
     peer: Option<Ipv6Addr>,
 ) -> io::Result<()> {
     let Some((current_prefix, current_peer, by_hand_for_good)) = v6_state(socket, name, ip)? else {
+        // XNU puts the address on the interface, then fails it for the
+        // route to its peer that it cannot add: one is there for a second
+        // address to the peer, and for the same address and peer on
+        // another interface. What it leaves takes the route of the same ip
+        // of another interface with it when it goes, so it is not asked.
+        if let Some(peer) = peer
+            && has_host_route(peer)?
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                format!("{ip} takes a route to its peer {peer}, and one is there"),
+            ));
+        }
         return add_v6(socket, name, ip, prefix, peer);
     };
 
@@ -334,11 +347,12 @@ fn add_v6(
     let added = ioctl(socket, SIOCAIFADDR_IN6, &mut request);
     if added.is_err() {
         // XNU leaves an address on the interface when it fails it after it
-        // has put it there, as it fails a second address to one peer, whose
-        // route is there already. What is left has no route and is in no
-        // group, and is as asked to every request for its state: it goes.
-        // Where XNU failed the address before that, there is nothing to
-        // delete, and the error of the add is the one to report either way.
+        // has put it there, as for a route to its peer that came to be
+        // there since `replace_v6` looked. What is left has no route and is
+        // in no group, and is as asked to every request for its state: it
+        // goes now, as it would with its interface. Where XNU failed the
+        // address before that, there is nothing to delete, and the error
+        // of the add is the one to report either way.
         let _ = ioctl(socket, SIOCDIFADDR_IN6, &mut in6_request(name, ip));
     }
 
@@ -584,6 +598,15 @@ mod tests {
             state(Ipv6Addr::new(0x2001, 0xdb8, 0xfb, 0, 0, 0, 0, 1)),
             None
         );
+    }
+
+    #[test]
+    #[ignore = "black-box check against the live macOS routing table"]
+    fn a_host_route_of_its_own_is_told_from_the_route_to_a_host() {
+        // The address of the host has one. The kernel routes an address of
+        // the documentation prefix by a route to more than it, or by none.
+        assert!(has_host_route(Ipv6Addr::LOCALHOST).unwrap());
+        assert!(!has_host_route(Ipv6Addr::new(0x2001, 0xdb8, 0xfb, 0, 0, 0, 0, 1)).unwrap());
     }
 
     /// A `utun` interface, which is point-to-point and goes with its
@@ -868,30 +891,56 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires root, and configures utun interfaces of its own"]
+    fn an_ipv6_address_takes_a_peer_that_no_route_is_there_to() {
+        let (utun, other) = (utun(), utun());
+        let ip = |last| Ipv6Addr::new(0x2001, 0xdb8, 0xfb, 3, 0, 0, 0, last);
+        let peer = IpAddr::V6(ip(9));
+        let first = v6_address(utun.index, [3, 1], 128).peer(peer);
+        replace_address(&first).unwrap();
+        assert!(has_host_route(ip(1)).unwrap());
+
+        // A second address to the peer, and the same address and peer on
+        // another interface, are refused before the kernel is asked.
+        let second = v6_address(utun.index, [3, 2], 128).peer(peer);
+        let same = v6_address(other.index, [3, 1], 128).peer(peer);
+        for address in [second, same] {
+            let error = replace_address(&address).unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::AlreadyExists);
+            assert_eq!(error.raw_os_error(), None);
+        }
+        assert_eq!(addresses(utun.index), HashSet::from([first]));
+        assert_eq!(addresses(other.index), HashSet::new());
+
+        // The route to the address stays when the other interface goes: it
+        // went with what the kernel left there of an address it failed.
+        drop(other);
+        assert!(has_host_route(ip(1)).unwrap());
+
+        // The peer takes an address again once it has none.
+        delete_address(&first).unwrap();
+        assert!(!has_host_route(ip(9)).unwrap());
+        replace_address(&second).unwrap();
+        assert_eq!(addresses(utun.index), HashSet::from([second]));
+    }
+
+    #[test]
     #[ignore = "requires root, and configures a utun interface of its own"]
     fn an_ipv6_address_the_kernel_fails_leaves_nothing_of_it() {
         let utun = utun();
-        let peer = |last| IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0xfb, 3, 0, 0, 0, last));
-        let first = v6_address(utun.index, [3, 1], 128).peer(peer(9));
-        let second = v6_address(utun.index, [3, 2], 128);
-
+        let socket = socket(AF_INET6).unwrap();
+        let name = name(utun.index).unwrap();
+        let ip = |last| Ipv6Addr::new(0x2001, 0xdb8, 0xfb, 4, 0, 0, 0, last);
+        let first = v6_address(utun.index, [4, 1], 128).peer(IpAddr::V6(ip(9)));
         replace_address(&first).unwrap();
-        // The route to the peer is there already: XNU fails the address
-        // after it has put it on the interface.
-        assert_eq!(
-            replace_address(&second.peer(peer(9)))
-                .unwrap_err()
-                .raw_os_error(),
-            Some(libc::EEXIST)
-        );
-        assert_eq!(addresses(utun.index), HashSet::from([first]));
 
-        // Nothing of it is left to be taken for the address.
-        replace_address(&second.peer(peer(8))).unwrap();
-        assert_eq!(
-            addresses(utun.index),
-            HashSet::from([first, second.peer(peer(8))])
-        );
+        // As when the route to the peer came to be there after
+        // replace_address looked for it: XNU fails the address after it has
+        // put it on the interface.
+        let added = add_v6(socket.as_fd(), name, ip(2), 128, Some(ip(9)));
+        assert_eq!(added.unwrap_err().raw_os_error(), Some(libc::EEXIST));
+        assert_eq!(v6_state(socket.as_fd(), name, ip(2)).unwrap(), None);
+        assert_eq!(addresses(utun.index), HashSet::from([first]));
     }
 
     #[test]
