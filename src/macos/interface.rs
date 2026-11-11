@@ -282,6 +282,12 @@ fn set_peerless(socket: BorrowedFd<'_>, name: IfName, ip: Ipv4Addr, prefix: u8) 
 /// whether it was set by hand, for good.
 type V6State = (u8, Option<Ipv6Addr>, bool);
 
+/// Adds `ip/prefix`, or leaves it where the interface has it as asked. No
+/// request sets an address that is there: XNU would keep its prefix and
+/// peer, join its multicast groups anew, and delete it where that fails. It
+/// would leave a deprecated one deprecated. And its sources have it lose
+/// count of the addresses of a prefix when one it autoconfigured becomes one
+/// set by hand, and panic when an address of the prefix is deleted later.
 fn replace_v6(
     socket: BorrowedFd<'_>,
     name: IfName,
@@ -289,29 +295,59 @@ fn replace_v6(
     prefix: u8,
     peer: Option<Ipv6Addr>,
 ) -> io::Result<()> {
-    if let Some((current_prefix, current_peer, by_hand_for_good)) = v6_state(socket, name, ip)? {
-        // XNU gives an address its prefix and peer when it adds it, and
-        // changes neither after.
-        if (current_prefix, current_peer) != (prefix, peer) {
-            let with_peer = current_peer.map_or(String::new(), |peer| format!(" with peer {peer}"));
-            return Err(io::Error::new(
-                io::ErrorKind::AlreadyExists,
-                format!(
-                    "{ip} is there under prefix {current_prefix}{with_peer}, and macOS changes \
-                     neither: delete it first"
-                ),
-            ));
-        }
-        // XNU joins the multicast groups of an address anew each time it is
-        // set: one that is as asked is left as it is.
-        if by_hand_for_good {
-            return Ok(());
-        }
+    let Some((current_prefix, current_peer, by_hand_for_good)) = v6_state(socket, name, ip)? else {
+        return add_v6(socket, name, ip, prefix, peer);
+    };
+
+    let there = |what: String| {
+        Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            format!("{ip} is there {what}: delete it first"),
+        ))
+    };
+    if (current_prefix, current_peer) != (prefix, peer) {
+        let with_peer = current_peer.map_or(String::new(), |peer| format!(" with peer {peer}"));
+        return there(format!(
+            "under prefix {current_prefix}{with_peer}, and macOS changes neither"
+        ));
+    }
+    if !by_hand_for_good {
+        return there(
+            "as the system gave it to the interface, or with a lifetime, and macOS has no safe \
+             way to set it by hand, for good"
+                .into(),
+        );
     }
 
-    // A new address, or one the system gave the interface, which becomes
-    // one set by hand, for good.
-    let mut request = In6AliasReq {
+    Ok(())
+}
+
+/// Adds `ip/prefix` to an interface that does not have `ip`.
+fn add_v6(
+    socket: BorrowedFd<'_>,
+    name: IfName,
+    ip: Ipv6Addr,
+    prefix: u8,
+    peer: Option<Ipv6Addr>,
+) -> io::Result<()> {
+    // TODO: XNU leaves an address on the interface when it fails it after
+    // it has put it there, as its sources have it do for a second address
+    // to one peer, whose route is there already.
+    ioctl(
+        socket,
+        SIOCAIFADDR_IN6,
+        &mut in6_alias_request(name, ip, prefix, peer),
+    )
+}
+
+/// The request that adds `ip/prefix` as an address set by hand, for good.
+fn in6_alias_request(
+    name: IfName,
+    ip: Ipv6Addr,
+    prefix: u8,
+    peer: Option<Ipv6Addr>,
+) -> In6AliasReq {
+    In6AliasReq {
         name,
         addr: in6_sockaddr(ip),
         // No peer is a sockaddr of no family.
@@ -324,11 +360,7 @@ fn replace_v6(
             ia6t_vltime: INFINITE_LIFETIME,
             ia6t_pltime: INFINITE_LIFETIME,
         },
-    };
-    // TODO: XNU leaves an address on the interface when it fails it after
-    // it has put it there, as its sources have it do for a second address
-    // to one peer, whose route is there already.
-    ioctl(socket, SIOCAIFADDR_IN6, &mut request)
+    }
 }
 
 /// What the address `ip` of the interface `name` is, if the interface has
@@ -797,6 +829,37 @@ mod tests {
         delete_address(&wider).unwrap();
         assert_kind(delete_address(&wider), io::ErrorKind::NotFound);
         assert_eq!(addresses(utun.index), HashSet::new());
+    }
+
+    #[test]
+    #[ignore = "requires root, and configures a utun interface of its own"]
+    fn an_ipv6_address_that_is_not_set_by_hand_for_good_is_deleted_first() {
+        const IN6_IFF_DYNAMIC: c_int = 0x100;
+
+        let utun = utun();
+        let socket = socket(AF_INET6).unwrap();
+        let name = name(utun.index).unwrap();
+        // An address as DHCPv6 gives one, and one that expires in an hour,
+        // under the prefix that XNU counts no addresses of.
+        for (last, flags, lifetime) in [(1, IN6_IFF_DYNAMIC, INFINITE_LIFETIME), (2, 0, 3600)] {
+            let ip = Ipv6Addr::new(0x2001, 0xdb8, 0xfb, 2, 0, 0, 0, last);
+            let address = Address::new(utun.index, IpAddr::V6(ip), 128);
+            let state = || v6_state(socket.as_fd(), name, ip).unwrap();
+
+            let mut request = in6_alias_request(name, ip, 128, None);
+            request.flags = flags;
+            request.lifetime.ia6t_vltime = lifetime;
+            request.lifetime.ia6t_pltime = lifetime;
+            ioctl(socket.as_fd(), SIOCAIFADDR_IN6, &mut request).unwrap();
+            assert_eq!(state(), Some((128, None, false)));
+
+            // No request sets it where it is.
+            assert_kind(replace_address(&address), io::ErrorKind::AlreadyExists);
+            assert_eq!(state(), Some((128, None, false)));
+            delete_address(&address).unwrap();
+            replace_address(&address).unwrap();
+            assert_eq!(state(), Some((128, None, true)));
+        }
     }
 
     #[test]

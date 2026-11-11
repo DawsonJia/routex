@@ -101,10 +101,11 @@ impl Handle {
 
     /// Makes `address` an address of its interface, whether or not it is
     /// one already. An interface has an `ip` once, so this changes the
-    /// prefix and peer of an IPv4 address that is there. The kernel changes
-    /// neither of an IPv6 address: this fails with `AlreadyExists`, and
-    /// changes nothing, when the address is there with another, and a
-    /// caller deletes it first.
+    /// prefix and peer of an IPv4 address that is there. It sends no
+    /// request for an IPv6 address that is there, as the kernel has no safe
+    /// one: the address stays if it is as asked, set by hand and with no
+    /// lifetime, and this fails with `AlreadyExists` if it is not, for a
+    /// caller to delete it first.
     ///
     /// A peer takes a point-to-point interface, such as a `utun`. There, an
     /// IPv4 address without a peer is the first IPv4 address of the

@@ -196,18 +196,21 @@ fn main() {}
   address goes with its interface.
 - What is there already is the platform's to say. On macOS and Windows an
   interface has an `ip` once, and `delete_address` deletes it by its `ip`
-  alone. `replace_address` changes the prefix of the one that is there, and
-  on macOS the peer of an IPv4 one. On Linux an IPv4 address is its `ip`,
-  `prefix` and `peer`: with another prefix or peer it is another address,
-  which `replace_address` adds beside the first, and each is deleted by its
-  own.
+  alone. `replace_address` changes the prefix of the one that is there on
+  Windows, and the prefix and peer of an IPv4 one on macOS. On Linux an IPv4
+  address is its `ip`, `prefix` and `peer`: with another prefix or peer it is
+  another address, which `replace_address` adds beside the first, and each is
+  deleted by its own.
 - On Linux and macOS an interface has an IPv6 `ip` once, and the kernel does
   not change the prefix it was added with: a caller that changes the prefix,
   or takes the peer away, deletes the address first. macOS says so:
-  `replace_address` of an IPv6 address that is there with another prefix or
-  peer fails with `io::ErrorKind::AlreadyExists`, and changes nothing. Linux
-  does not: it gives the address a new peer, and leaves the prefix, and the
-  peer of an address asked for without one, with no error; its
+  `replace_address` sends no request for an IPv6 address that is there. It
+  leaves one that is as asked, and fails with `io::ErrorKind::AlreadyExists`
+  for one with another prefix or peer, and for one that is not set by hand
+  for good, which the system gave the interface or which has a lifetime: the
+  kernel has no safe request to change either.
+  Linux does not: it gives the address a new peer, and leaves the prefix, and
+  the peer of an address asked for without one, with no error; its
   `delete_address` takes the prefix that is there.
 - An `Address::peer` is the other end of a point-to-point link; the address
   then brings a route to the peer, not to its prefix. Linux takes a peer on
