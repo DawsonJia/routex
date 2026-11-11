@@ -604,9 +604,10 @@ mod tests {
     #[ignore = "black-box check against the live macOS routing table"]
     fn a_host_route_of_its_own_is_told_from_the_route_to_a_host() {
         // The address of the host has one. The kernel routes an address of
-        // the documentation prefix by a route to more than it, or by none.
+        // the documentation prefix by a route to more than it, or by none:
+        // one that no test configures, under no prefix that one does.
         assert!(has_host_route(Ipv6Addr::LOCALHOST).unwrap());
-        assert!(!has_host_route(Ipv6Addr::new(0x2001, 0xdb8, 0xfb, 0, 0, 0, 0, 1)).unwrap());
+        assert!(!has_host_route(Ipv6Addr::new(0x2001, 0xdb8, 0xfc, 0, 0, 0, 0, 1)).unwrap());
     }
 
     /// A `utun` interface, which is point-to-point and goes with its
