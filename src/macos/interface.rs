@@ -330,14 +330,19 @@ fn add_v6(
     prefix: u8,
     peer: Option<Ipv6Addr>,
 ) -> io::Result<()> {
-    // TODO: XNU leaves an address on the interface when it fails it after
-    // it has put it there, as its sources have it do for a second address
-    // to one peer, whose route is there already.
-    ioctl(
-        socket,
-        SIOCAIFADDR_IN6,
-        &mut in6_alias_request(name, ip, prefix, peer),
-    )
+    let mut request = in6_alias_request(name, ip, prefix, peer);
+    let added = ioctl(socket, SIOCAIFADDR_IN6, &mut request);
+    if added.is_err() {
+        // XNU leaves an address on the interface when it fails it after it
+        // has put it there, as it fails a second address to one peer, whose
+        // route is there already. What is left has no route and is in no
+        // group, and is as asked to every request for its state: it goes.
+        // Where XNU failed the address before that, there is nothing to
+        // delete, and the error of the add is the one to report either way.
+        let _ = ioctl(socket, SIOCDIFADDR_IN6, &mut in6_request(name, ip));
+    }
+
+    added
 }
 
 /// The request that adds `ip/prefix` as an address set by hand, for good.
@@ -860,6 +865,33 @@ mod tests {
             replace_address(&address).unwrap();
             assert_eq!(state(), Some((128, None, true)));
         }
+    }
+
+    #[test]
+    #[ignore = "requires root, and configures a utun interface of its own"]
+    fn an_ipv6_address_the_kernel_fails_leaves_nothing_of_it() {
+        let utun = utun();
+        let peer = |last| IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0xfb, 3, 0, 0, 0, last));
+        let first = v6_address(utun.index, [3, 1], 128).peer(peer(9));
+        let second = v6_address(utun.index, [3, 2], 128);
+
+        replace_address(&first).unwrap();
+        // The route to the peer is there already: XNU fails the address
+        // after it has put it on the interface.
+        assert_eq!(
+            replace_address(&second.peer(peer(9)))
+                .unwrap_err()
+                .raw_os_error(),
+            Some(libc::EEXIST)
+        );
+        assert_eq!(addresses(utun.index), HashSet::from([first]));
+
+        // Nothing of it is left to be taken for the address.
+        replace_address(&second.peer(peer(8))).unwrap();
+        assert_eq!(
+            addresses(utun.index),
+            HashSet::from([first, second.peer(peer(8))])
+        );
     }
 
     #[test]
